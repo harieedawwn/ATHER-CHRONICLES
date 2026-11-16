@@ -1,0 +1,8 @@
+{
+  "name": "INKBLITZ: Aether Stick Fighters",
+  "description": "A 2D HD-Pixel anime platform fighting game with four distinct stickman warriors, directional combat, and Stock or HP rulesets.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
