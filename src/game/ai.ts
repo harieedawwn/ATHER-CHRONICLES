@@ -1,3 +1,4 @@
+import { createDefaultRng, RngFn } from './rng';
 import { AIDifficulty, FighterState, GameMode, InputState, StageSpec, TrainingBehavior } from './types';
 
 function emptyInput(): InputState {
@@ -23,6 +24,15 @@ export class AIController {
   private holdStrong = 0;
   private strafeDir: -1 | 0 | 1 = 0;
   private strafeTimer = 0;
+  private rng: RngFn;
+
+  constructor(rng: RngFn = createDefaultRng()) {
+    this.rng = rng;
+  }
+
+  public setRng(rng: RngFn): void {
+    this.rng = rng;
+  }
 
   public computeInput(
     self: FighterState,
@@ -50,15 +60,14 @@ export class AIController {
       return this.computeTrainingInput(self, target, stage, trainingBehavior, tick, inp);
     }
 
-    // Off-stage / Chasm recovery priority (handles both single-floor & split-island stages)!
+    // Off-stage / Chasm recovery priority (navigates around solid ledges—never tries to phase through from below!)
     const mainPlats = stage.platforms.filter((p) => p.isMain);
     const overAnyMain = mainPlats.some(
       (p) => self.x >= p.x - p.width * 0.5 + 8 && self.x <= p.x + p.width * 0.5 - 8
     );
     const floorY = mainPlats[0]?.y ?? 124;
 
-    if ((!overAnyMain || self.y > floorY + 14) && !self.grounded) {
-      // Steer toward the nearest main island center
+    if ((!overAnyMain || self.y > floorY + 12) && !self.grounded) {
       let nearestIsland = mainPlats[0];
       let bestDist = Infinity;
       for (const mp of mainPlats) {
@@ -69,16 +78,26 @@ export class AIController {
         }
       }
       if (nearestIsland) {
-        if (self.x < nearestIsland.x - 8) inp.right = true;
-        else if (self.x > nearestIsland.x + 8) inp.left = true;
+        const iLeft = nearestIsland.x - nearestIsland.width * 0.5;
+        const iRight = nearestIsland.x + nearestIsland.width * 0.5;
+        // If below the platform deck, steer slightly outside the ledge first so we don't bonk our head underneath!
+        if (self.y > floorY - 6 && self.x > iLeft - 6 && self.x < iRight + 6) {
+          const toLeftEdge = Math.abs(self.x - iLeft);
+          const toRightEdge = Math.abs(self.x - iRight);
+          if (toLeftEdge < toRightEdge) inp.left = true;
+          else inp.right = true;
+        } else {
+          if (self.x < nearestIsland.x - 10) inp.right = true;
+          else if (self.x > nearestIsland.x + 10) inp.left = true;
+        }
       }
 
-      if (self.y > floorY - 12 && self.jumpsLeft > 0 && tick % 6 === 0) {
+      if (self.y > floorY - 14 && self.jumpsLeft > 0 && tick % 5 === 0) {
         inp.jump = true;
-        this.holdJump = 5;
+        this.holdJump = 6;
         return inp;
       }
-      if (self.y > floorY + 4 && self.action !== 'attack') {
+      if (self.y > floorY + 2 && self.action !== 'attack') {
         inp.up = true;
         inp.special = true;
         return inp;
@@ -86,15 +105,21 @@ export class AIController {
       return inp;
     }
 
-    // Jump across split-island center chasm when running between islands
-    if (
-      mainPlats.length > 1 &&
-      self.grounded &&
-      Math.abs(self.x) < 88 &&
-      Math.sign(target.x - self.x) !== Math.sign(self.x)
-    ) {
-      inp.jump = true;
-      this.holdJump = 7;
+    // Jump across split-island chasms or 3-car train gaps when running toward opponent
+    if (mainPlats.length > 1 && self.grounded) {
+      for (const mp of mainPlats) {
+        const iLeft = mp.x - mp.width * 0.5;
+        const iRight = mp.x + mp.width * 0.5;
+        if (self.x >= iLeft && self.x <= iRight) {
+          const nearLeftEdge = self.x - iLeft < 28 && target.x < iLeft;
+          const nearRightEdge = iRight - self.x < 28 && target.x > iRight;
+          if (nearLeftEdge || nearRightEdge) {
+            inp.jump = true;
+            this.holdJump = 7;
+            break;
+          }
+        }
+      }
     }
 
     // Special state: Kuro suspended mid-air -> execute Dunk!
@@ -109,24 +134,24 @@ export class AIController {
       target.actionFrame === 10 &&
       self.grounded &&
       self.action === 'idle' &&
-      Math.random() < 0.65
+      this.rng() < 0.65
     ) {
       inp.taunt = true;
       return inp;
     }
 
     // Evasion Priority: Opponent is unleashing an UNBLOCKABLE Ultimate (`V`)!
-    // Since Ultimates cannot be blocked or parried, AI attempts to run, dash, or jump out of the danger zone!
-    if (target.action === 'ultimate' && target.actionFrame >= 45 && target.actionFrame <= 96) {
+    // During Act II (frames 73..132), time unfreezes so opponents can run, dash, or jump out of the rush!
+    if (target.action === 'ultimate' && target.actionFrame >= 73 && target.actionFrame <= 132) {
       const evadeSkill = difficulty === 'boss' ? 0.85 : difficulty === 'normal' ? 0.5 : 0.2;
-      if (Math.random() < evadeSkill) {
-        // Run/dash away from the caster's facing direction or jump high over horizontal slashes
-        const dangerCenterX = target.x + target.facing * 110;
+      if (this.rng() < evadeSkill) {
+        // Run/dash away from the caster's rush zone or jump high over the sprint
+        const dangerCenterX = target.anchorX;
         const fleeDir: -1 | 1 = self.x < dangerCenterX ? -1 : 1;
         if (fleeDir < 0) inp.left = true;
         else inp.right = true;
         if (tick % 8 === 0) inp.dash = true;
-        if (self.grounded && Math.abs(self.x - dangerCenterX) < 120 && tick % 10 === 0) {
+        if (self.grounded && Math.abs(self.x - dangerCenterX) < 130 && tick % 10 === 0) {
           inp.jump = true;
           this.holdJump = 8;
         }
@@ -155,7 +180,7 @@ export class AIController {
         inp.dash = true;
       }
     } else if (absDx < 22 && this.strafeTimer <= 0) {
-      this.strafeDir = Math.random() < 0.5 ? (-dirToTarget as -1 | 1) : dirToTarget;
+      this.strafeDir = this.rng() < 0.5 ? (-dirToTarget as -1 | 1) : dirToTarget;
       this.strafeTimer = 14;
     }
 
@@ -181,7 +206,7 @@ export class AIController {
       absDx <= 185 &&
       Math.abs(dy) < 55 &&
       target.action !== 'ko_respawn' &&
-      Math.random() < (difficulty === 'boss' ? 0.65 : difficulty === 'normal' ? 0.38 : 0.18)
+      this.rng() < (difficulty === 'boss' ? 0.65 : difficulty === 'normal' ? 0.38 : 0.18)
     ) {
       if (dirToTarget > 0) inp.right = true;
       else inp.left = true;
@@ -194,12 +219,12 @@ export class AIController {
     const targetAttacking =
       target.action === 'attack' || target.action === 'strong_charge';
     if (targetAttacking && absDx < 78 && Math.abs(dy) < 48) {
-      if (self.id === 'kenji' && Math.random() < (difficulty === 'boss' ? 0.72 : difficulty === 'normal' ? 0.42 : 0.12)) {
+      if (self.id === 'kenji' && this.rng() < (difficulty === 'boss' ? 0.72 : difficulty === 'normal' ? 0.42 : 0.12)) {
         inp.special = true; // Neutral J = Observation Haki!
         this.cooldown = 28;
         return inp;
       }
-      if (difficulty !== 'easy' && Math.random() < 0.35) {
+      if (difficulty !== 'easy' && this.rng() < 0.35) {
         inp.dash = true;
         if (dirToTarget > 0) inp.left = true;
         else inp.right = true;
@@ -208,13 +233,13 @@ export class AIController {
       }
     }
 
-    if (Math.random() > aggression) {
+    if (this.rng() > aggression) {
       this.cooldown = 10;
       return inp;
     }
 
     // Character-specific smart specials
-    if (Math.random() < specialChance) {
+    if (this.rng() < specialChance) {
       if (self.id === 'kuro') {
         if (absDx > 95 && absDx < 260) {
           // Neutral Special: Blink behind & suspend!
@@ -310,7 +335,7 @@ export class AIController {
         }
       } else if (self.id === 'nyx') {
         if (absDx > 90 && absDx < 220) {
-          if (Math.random() < 0.5) {
+          if (this.rng() < 0.5) {
             if (dirToTarget > 0) inp.right = true;
             else inp.left = true;
             inp.special = true; // Wormhole Gate!
@@ -321,7 +346,7 @@ export class AIController {
           }
           this.cooldown = 25;
           return inp;
-        } else if (absDx < 120 && Math.random() < 0.35) {
+        } else if (absDx < 120 && this.rng() < 0.35) {
           inp.down = true;
           inp.special = true; // Spatial Inversion!
           this.cooldown = 32;
@@ -346,7 +371,7 @@ export class AIController {
 
     // Close-range melee mixups
     if (absDx < 62 && Math.abs(dy) < 48) {
-      const r = Math.random();
+      const r = this.rng();
       if (!self.grounded) {
         if (dy > 18) inp.down = true;
         else if (dy < -16) inp.up = true;

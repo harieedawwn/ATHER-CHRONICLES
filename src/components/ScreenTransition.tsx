@@ -38,7 +38,7 @@ export const ScreenTransition: React.FC<ScreenTransitionProps> = ({ kind, config
             exit={{ x: '-100%', y: '-100%', transition: { duration: 0.32, ease: EXPO_EASE } }}
           >
             <span className="font-display text-6xl font-extrabold tracking-widest text-outline-subtle select-none">
-              INKBLITZ // SYSTEM
+              ZANSHIN // SYSTEM
             </span>
           </motion.div>
 
@@ -51,7 +51,7 @@ export const ScreenTransition: React.FC<ScreenTransitionProps> = ({ kind, config
             exit={{ x: '100%', y: '100%', transition: { duration: 0.32, ease: EXPO_EASE } }}
           >
             <span className="font-display text-6xl font-extrabold tracking-widest text-amber-400/20 select-none">
-              AETHER CHRONICLES
+              INK DUELISTS
             </span>
           </motion.div>
 

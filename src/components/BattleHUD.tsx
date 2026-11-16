@@ -267,6 +267,10 @@ export const BattleHUD: React.FC<BattleHUDProps> = ({
     const next = !muted;
     sound.setMuted(next);
     setMuted(next);
+    if (!next) {
+      sound.unlock();
+      sound.playUiToggle(true);
+    }
   };
 
   const holdTouch = (key: keyof InputState) => ({
@@ -324,7 +328,11 @@ export const BattleHUD: React.FC<BattleHUDProps> = ({
           </div>
           <div className="flex items-center gap-1">
             <button
-              onClick={onTogglePause}
+              onClick={() => {
+                sound.unlock();
+                sound.playUiToggle(!hud.paused);
+                onTogglePause();
+              }}
               title="Pause (Esc)"
               className="p-1.5 bg-[#060913]/90 border border-slate-800 text-slate-300 hover:text-amber-300 hover:border-amber-400 transition-colors cursor-pointer"
             >
@@ -338,7 +346,11 @@ export const BattleHUD: React.FC<BattleHUDProps> = ({
               {muted ? <VolumeX className="w-3.5 h-3.5 text-rose-400" /> : <Volume2 className="w-3.5 h-3.5" />}
             </button>
             <button
-              onClick={() => setShowTouchPad((v) => !v)}
+              onClick={() => {
+                sound.unlock();
+                sound.playUiToggle(!showTouchPad);
+                setShowTouchPad((v) => !v);
+              }}
               title="Toggle On-Screen Touch Controls"
               className={`p-1.5 bg-[#060913]/90 border text-slate-300 hover:text-slate-100 cursor-pointer ${
                 showTouchPad ? 'border-amber-400 text-amber-300' : 'border-slate-800'
@@ -422,7 +434,12 @@ export const BattleHUD: React.FC<BattleHUDProps> = ({
             {(['idle', 'guard', 'counter', 'attack', 'recover'] as TrainingBehavior[]).map((b) => (
               <button
                 key={b}
-                onClick={() => onTrainingBehavior(b)}
+                onMouseEnter={() => sound.playUiHover()}
+                onClick={() => {
+                  sound.unlock();
+                  sound.playUiClick();
+                  onTrainingBehavior(b);
+                }}
                 className={`px-2 py-1 capitalize border font-mono-num text-[11px] cursor-pointer transition-colors ${
                   hud.training.dummyBehavior === b
                     ? 'bg-amber-400 text-slate-950 border-amber-400 font-bold'
@@ -435,7 +452,12 @@ export const BattleHUD: React.FC<BattleHUDProps> = ({
           </div>
 
           <button
-            onClick={onToggleHitboxes}
+            onMouseEnter={() => sound.playUiHover()}
+            onClick={() => {
+              sound.unlock();
+              sound.playUiToggle(!hud.training.showHitboxes);
+              onToggleHitboxes();
+            }}
             className={`flex items-center gap-1 px-2 py-1 border font-mono-num text-[11px] cursor-pointer ${
               hud.training.showHitboxes
                 ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
@@ -447,7 +469,12 @@ export const BattleHUD: React.FC<BattleHUDProps> = ({
           </button>
 
           <button
-            onClick={onToggleAutoHeal}
+            onMouseEnter={() => sound.playUiHover()}
+            onClick={() => {
+              sound.unlock();
+              sound.playUiToggle(!hud.training.autoHeal);
+              onToggleAutoHeal();
+            }}
             className={`px-2 py-1 border font-mono-num text-[11px] cursor-pointer ${
               hud.training.autoHeal
                 ? 'bg-sky-500/20 border-sky-400 text-sky-300'
@@ -458,7 +485,12 @@ export const BattleHUD: React.FC<BattleHUDProps> = ({
           </button>
 
           <button
-            onClick={onResetTraining}
+            onMouseEnter={() => sound.playUiHover()}
+            onClick={() => {
+              sound.unlock();
+              sound.playUiClick();
+              onResetTraining();
+            }}
             className="flex items-center gap-1 px-2 py-1 bg-slate-900 border border-slate-700 text-slate-200 hover:border-amber-400 font-mono-num text-[11px] cursor-pointer"
           >
             <RotateCcw className="w-3 h-3" />
@@ -572,27 +604,47 @@ export const BattleHUD: React.FC<BattleHUDProps> = ({
                 MATCH PAUSED
               </h2>
               <button
-                onClick={onTogglePause}
+                onMouseEnter={() => sound.playUiHover()}
+                onClick={() => {
+                  sound.unlock();
+                  sound.playUiConfirm();
+                  onTogglePause();
+                }}
                 className="clip-blade-r w-full py-2.5 text-sm font-display font-extrabold uppercase tracking-wider text-slate-950 bg-amber-400 hover:bg-amber-300 cursor-pointer"
               >
                 Resume Duel
               </button>
               <button
-                onClick={onRestart}
+                onMouseEnter={() => sound.playUiHover()}
+                onClick={() => {
+                  sound.unlock();
+                  sound.playUiClick();
+                  onRestart();
+                }}
                 className="w-full flex items-center justify-center gap-2 py-2.5 text-xs font-mono-num font-bold uppercase text-slate-200 bg-slate-900 border border-slate-700 hover:border-amber-400 cursor-pointer"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
                 Restart Match
               </button>
               <button
-                onClick={onChangeFighters}
+                onMouseEnter={() => sound.playUiHover()}
+                onClick={() => {
+                  sound.unlock();
+                  sound.playUiBack();
+                  onChangeFighters();
+                }}
                 className="w-full flex items-center justify-center gap-2 py-2.5 text-xs font-mono-num font-bold uppercase text-slate-200 bg-slate-900 border border-slate-700 hover:border-amber-400 cursor-pointer"
               >
                 <Users className="w-3.5 h-3.5" />
                 Fighter Select
               </button>
               <button
-                onClick={onMainMenu}
+                onMouseEnter={() => sound.playUiHover()}
+                onClick={() => {
+                  sound.unlock();
+                  sound.playUiBack();
+                  onMainMenu();
+                }}
                 className="w-full flex items-center justify-center gap-2 py-2.5 text-xs font-mono-num font-bold uppercase text-slate-200 bg-slate-900 border border-slate-700 hover:border-amber-400 cursor-pointer"
               >
                 <Home className="w-3.5 h-3.5" />

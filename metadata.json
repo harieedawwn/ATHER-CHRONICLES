@@ -1,8 +1,6 @@
 {
-  "name": "INKBLITZ: Aether Stick Fighters",
-  "description": "A 2D HD-Pixel anime platform fighting game with four distinct stickman warriors, directional combat, and Stock or HP rulesets.",
+  "name": "ZANSHIN — Ink Duelists",
+  "description": "High-speed 2D HD-pixel anime platform fighter with nine distinct duelists, eight dynamic stages, 2.5D Ultimates, and Stock or Stamina rulesets.",
   "requestFramePermissions": [],
-  "majorCapabilities": [
-    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
-  ]
+  "majorCapabilities": []
 }

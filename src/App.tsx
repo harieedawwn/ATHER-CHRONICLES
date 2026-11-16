@@ -4,7 +4,6 @@ import { MatchSetup } from './components/MatchSetup';
 import { PostMatchModal } from './components/PostMatchModal';
 import { ScreenTransition, TransitionKind } from './components/ScreenTransition';
 import { TitleScreen } from './components/TitleScreen';
-import { sound } from './game/audio';
 import { GameEngine } from './game/engine';
 import {
   GameMode,
@@ -15,7 +14,8 @@ import {
   TrainingBehavior,
 } from './game/types';
 
-const STORAGE_KEY = 'inkblitz_match_config_v1';
+const STORAGE_KEY = 'zanshin_match_config_v1';
+const LEGACY_STORAGE_KEY = 'inkblitz_match_config_v1';
 
 const DEFAULT_CONFIG: MatchConfig = {
   mode: 'vs_ai',
@@ -29,7 +29,9 @@ const DEFAULT_CONFIG: MatchConfig = {
 
 function loadConfig(): MatchConfig {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw =
+      localStorage.getItem(STORAGE_KEY) ??
+      localStorage.getItem(LEGACY_STORAGE_KEY);
     if (!raw) return DEFAULT_CONFIG;
     return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
   } catch {
@@ -93,7 +95,6 @@ export default function App() {
   );
 
   const handleStartFight = useCallback(() => {
-    sound.playClash();
     runScreenTransition(
       config.mode === 'vs_ai' ? 'vs_curtain' : 'slash',
       'battle',

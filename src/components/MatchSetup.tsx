@@ -139,72 +139,83 @@ const StageTopologyMini: React.FC<{ stageId: StageId; accent: string }> = ({
     >
       {stageId === 'void_flat' && (
         <g>
-          <circle cx="60" cy="16" r="8" fill="none" stroke={accent} strokeWidth="1.4" />
-          <rect x="14" y="31" width="92" height="4" fill={accent} />
-          <line x1="8" y1="36" x2="112" y2="36" stroke={accent} strokeOpacity="0.35" />
+          <circle cx="60" cy="14" r="7" fill="none" stroke={accent} strokeWidth="1.4" />
+          <rect x="20" y="21" width="3" height="10" fill="#1e3a5f" />
+          <rect x="97" y="21" width="3" height="10" fill="#1e3a5f" />
+          <rect x="12" y="30" width="96" height="6" fill={accent} />
+          <line x1="6" y1="38" x2="114" y2="38" stroke={accent} strokeOpacity="0.4" />
         </g>
       )}
       {stageId === 'torii' && (
         <g>
-          <circle cx="60" cy="16" r="9" fill={accent} fillOpacity="0.28" />
-          <rect x="20" y="32" width="80" height="4" fill={accent} />
-          <rect x="26" y="20" width="22" height="2.5" fill="#f8fafc" />
-          <rect x="72" y="20" width="22" height="2.5" fill="#f8fafc" />
+          <circle cx="60" cy="14" r="8" fill={accent} fillOpacity="0.28" />
+          <rect x="18" y="31" width="84" height="7" fill={accent} />
+          <rect x="22" y="21" width="22" height="3" fill="#f8fafc" />
+          <rect x="76" y="21" width="22" height="3" fill="#f8fafc" />
+          <rect x="48" y="12" width="24" height="3" fill="#fbbf24" />
         </g>
       )}
       {stageId === 'dojo' && (
         <g>
-          <rect x="22" y="33" width="76" height="4" fill={accent} />
-          <rect x="46" y="13" width="28" height="2.5" fill="#facc15" />
-          <rect x="20" y="22" width="18" height="2.5" fill="#38bdf8" />
-          <rect x="82" y="22" width="18" height="2.5" fill="#38bdf8" />
-          <path d="M29 16 L29 29 M91 16 L91 29" stroke="#38bdf8" strokeWidth="1" strokeDasharray="2 1" />
+          <rect x="20" y="33" width="80" height="6" fill={accent} />
+          <rect x="46" y="16" width="28" height="3" fill="#facc15" />
+          <rect x="28" y="7" width="18" height="2.5" fill="#fde047" />
+          <rect x="74" y="7" width="18" height="2.5" fill="#fde047" />
+          <rect x="18" y="23" width="18" height="3" fill="#38bdf8" />
+          <rect x="84" y="23" width="18" height="3" fill="#38bdf8" />
+          <path d="M27 6 L27 29 M93 6 L93 29" stroke="#94a3b8" strokeWidth="1" strokeDasharray="2 1" />
         </g>
       )}
       {stageId === 'monolith' && (
         <g>
           {/* Split Chasm + Moving Bridge + 2 Updraft Jump Pads */}
-          <rect x="10" y="31" width="38" height="5" fill={accent} />
-          <rect x="72" y="31" width="38" height="5" fill={accent} />
-          <rect x="49" y="23" width="22" height="2.5" fill="#f8fafc" />
-          <rect x="38" y="29" width="7" height="2.5" fill="#2dd4bf" />
-          <rect x="75" y="29" width="7" height="2.5" fill="#2dd4bf" />
-          <path d="M41 26 L41 15 M78 26 L78 15" stroke="#2dd4bf" strokeWidth="1.4" />
+          <rect x="8" y="30" width="40" height="8" fill={accent} />
+          <rect x="72" y="30" width="40" height="8" fill={accent} />
+          <rect x="49" y="22" width="22" height="3" fill="#f8fafc" />
+          <rect x="14" y="13" width="20" height="3" fill="#a7f3d0" />
+          <rect x="86" y="13" width="20" height="3" fill="#a7f3d0" />
+          <path d="M42 28 L42 15 M78 28 L78 15" stroke="#2dd4bf" strokeWidth="1.5" />
         </g>
       )}
       {stageId === 'coliseum' && (
         <g>
-          <rect x="6" y="34" width="108" height="5" fill={accent} />
-          <rect x="16" y="23" width="24" height="2.5" fill="#f8fafc" />
-          <rect x="80" y="23" width="24" height="2.5" fill="#f8fafc" />
-          <rect x="46" y="14" width="28" height="2.5" fill="#fbbf24" />
+          {/* Colossal 1080px Wide Arena + 5 Platforms + Outer Jump Catapults */}
+          <rect x="3" y="32" width="114" height="7" fill={accent} />
+          <rect x="10" y="20" width="20" height="3" fill="#f8fafc" />
+          <rect x="90" y="20" width="20" height="3" fill="#f8fafc" />
+          <rect x="33" y="22" width="18" height="3" fill="#fbbf24" />
+          <rect x="69" y="22" width="18" height="3" fill="#fbbf24" />
+          <rect x="47" y="11" width="26" height="3" fill="#fde047" />
         </g>
       )}
       {stageId === 'hypercube' && (
         <g>
-          <rect x="52" y="7" width="16" height="12" fill="none" stroke="#ec4899" strokeWidth="1.2" />
-          <rect x="18" y="33" width="84" height="3.5" fill={accent} />
-          <rect x="24" y="21" width="20" height="2.5" fill="#ec4899" />
-          <rect x="76" y="21" width="20" height="2.5" fill="#ec4899" />
+          <rect x="52" y="6" width="16" height="11" fill="none" stroke="#ec4899" strokeWidth="1.2" />
+          <rect x="10" y="32" width="100" height="5" fill={accent} />
+          <rect x="12" y="15" width="18" height="3" fill="#22d3ee" />
+          <rect x="90" y="15" width="18" height="3" fill="#22d3ee" />
+          <rect x="32" y="22" width="18" height="3" fill="#ec4899" />
+          <rect x="70" y="22" width="18" height="3" fill="#ec4899" />
         </g>
       )}
       {stageId === 'tesseract' && (
         <g>
-          {/* Warp Edges + Orbiting Platforms */}
-          <line x1="8" y1="6" x2="8" y2="38" stroke="#c084fc" strokeWidth="2" strokeDasharray="3 2" />
-          <line x1="112" y1="6" x2="112" y2="38" stroke="#c084fc" strokeWidth="2" strokeDasharray="3 2" />
-          <rect x="24" y="32" width="72" height="4" fill={accent} />
-          <circle cx="60" cy="19" r="9" fill="none" stroke="#facc15" strokeWidth="1" strokeDasharray="2 2" />
+          {/* Compact Loop + Warp Edges + Orbiting Platforms */}
+          <line x1="12" y1="6" x2="12" y2="38" stroke="#e879f9" strokeWidth="2" strokeDasharray="3 2" />
+          <line x1="108" y1="6" x2="108" y2="38" stroke="#e879f9" strokeWidth="2" strokeDasharray="3 2" />
+          <rect x="28" y="31" width="64" height="6" fill={accent} />
+          <circle cx="60" cy="18" r="8" fill="none" stroke="#facc15" strokeWidth="1.2" strokeDasharray="2 2" />
         </g>
       )}
       {stageId === 'train' && (
         <g>
-          {/* 2 High-Speed Train Cars + Wind Streaks */}
-          <rect x="8" y="29" width="50" height="7" fill={accent} />
-          <rect x="62" y="29" width="50" height="7" fill={accent} />
-          <rect x="38" y="19" width="44" height="2.5" fill="#38bdf8" />
-          <line x1="14" y1="11" x2="42" y2="11" stroke="#facc15" strokeWidth="1.4" />
-          <line x1="72" y1="14" x2="104" y2="14" stroke="#facc15" strokeWidth="1.4" />
+          {/* 3 Coupled High-Speed Bullet Train Cars + Catenary Decks */}
+          <rect x="4" y="29" width="33" height="8" fill={accent} />
+          <rect x="42" y="29" width="36" height="8" fill={accent} />
+          <rect x="83" y="29" width="33" height="8" fill={accent} />
+          <rect x="26" y="19" width="22" height="3" fill="#38bdf8" />
+          <rect x="72" y="19" width="22" height="3" fill="#38bdf8" />
+          <rect x="48" y="10" width="24" height="3" fill="#facc15" />
         </g>
       )}
     </svg>
@@ -266,16 +277,17 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
 
   const randomizeCurrentStep = () => {
     sound.unlock();
-    sound.playSwing(1.2, false);
     if (setupStep === 'fighters') {
       const ids = FIGHTER_LIST.map((f) => f.id);
       const p1 = ids[Math.floor(Math.random() * ids.length)];
       const remaining = ids.filter((id) => id !== p1);
       const p2 = remaining[Math.floor(Math.random() * remaining.length)];
+      sound.playUiSelectFighter(selectingSlot === 'p1' ? p1 : p2);
       update({ p1Fighter: p1, p2Fighter: p2 });
     } else {
       const stageIds = STAGE_LIST.map((s) => s.id);
       const randomStage = stageIds[Math.floor(Math.random() * stageIds.length)];
+      sound.playUiSelectStage(randomStage);
       update({ stageId: randomStage });
     }
   };
@@ -330,9 +342,9 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
         shockwaves: [],
         particles: [],
         callouts: [],
-        camX: 0,
-        camY: isFighterStep ? groundY - 18 : groundY - 42,
-        camZoom: isFighterStep ? 1.52 : 0.94,
+        camX: isFighterStep ? 0 : Math.sin(tick * 0.008) * (stage.wallRight > 400 ? 110 : 35),
+        camY: isFighterStep ? groundY - 18 : stage.id === 'dojo' ? groundY - 95 : groundY - 52,
+        camZoom: isFighterStep ? 1.52 : stage.wallRight > 450 ? 0.68 : stage.id === 'dojo' ? 0.78 : 0.88,
         shakeX: 0,
         shakeY: 0,
         impactFrames: 0,
@@ -352,43 +364,43 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
     switch (stageId) {
       case 'void_flat':
         return [
-          { icon: <Minus className="w-3.5 h-3.5 text-sky-400" />, label: 'Pure Flat Plane' },
-          { icon: <Shield className="w-3.5 h-3.5 text-amber-400" />, label: 'Zero Hazards' },
+          { icon: <Minus className="w-3.5 h-3.5 text-sky-400" />, label: '620px Pure Flat Sanctuary' },
+          { icon: <Shield className="w-3.5 h-3.5 text-amber-400" />, label: 'Solid Crystal Monolith' },
         ];
       case 'torii':
         return [
-          { icon: <Layers className="w-3.5 h-3.5 text-rose-400" />, label: 'Tri-Platform Shrine' },
-          { icon: <Swords className="w-3.5 h-3.5 text-amber-400" />, label: 'Standard Duel' },
+          { icon: <Layers className="w-3.5 h-3.5 text-rose-400" />, label: '560px Tri-Platform Shrine' },
+          { icon: <Swords className="w-3.5 h-3.5 text-amber-400" />, label: 'Solid Stone & Timber' },
         ];
       case 'dojo':
         return [
-          { icon: <ArrowUp className="w-3.5 h-3.5 text-amber-400" />, label: '2 Moving Elevators' },
-          { icon: <Layers className="w-3.5 h-3.5 text-sky-400" />, label: 'High Sky Loft' },
+          { icon: <ArrowUp className="w-3.5 h-3.5 text-amber-400" />, label: '5-Tier Vertical Pagoda' },
+          { icon: <Layers className="w-3.5 h-3.5 text-sky-400" />, label: 'Chain Elevators + High Roof' },
         ];
       case 'monolith':
         return [
-          { icon: <Zap className="w-3.5 h-3.5 text-emerald-400" />, label: '2 Updraft Jump Pads' },
-          { icon: <Sparkles className="w-3.5 h-3.5 text-rose-400" />, label: 'Center Abyss Gap' },
+          { icon: <Zap className="w-3.5 h-3.5 text-emerald-400" />, label: 'Twin Abyss Fortresses' },
+          { icon: <Sparkles className="w-3.5 h-3.5 text-rose-400" />, label: 'Moving Bridge + Geysers' },
         ];
       case 'coliseum':
         return [
-          { icon: <Maximize2 className="w-3.5 h-3.5 text-amber-400" />, label: 'Colossal 760px Wide' },
-          { icon: <Flame className="w-3.5 h-3.5 text-orange-400" />, label: '4 Upper Tiers' },
+          { icon: <Maximize2 className="w-3.5 h-3.5 text-amber-400" />, label: 'Colossal 1080px Arena' },
+          { icon: <Flame className="w-3.5 h-3.5 text-orange-400" />, label: '5 Tiers + Launch Catapults' },
         ];
       case 'hypercube':
         return [
-          { icon: <Box className="w-3.5 h-3.5 text-pink-400" />, label: '3D Perspective Grid' },
-          { icon: <Layers className="w-3.5 h-3.5 text-sky-400" />, label: 'Hover Holo-Decks' },
+          { icon: <Box className="w-3.5 h-3.5 text-pink-400" />, label: 'Wide 720px Cyber Overpass' },
+          { icon: <Layers className="w-3.5 h-3.5 text-sky-400" />, label: 'Hover Drones + Cyber Towers' },
         ];
       case 'tesseract':
         return [
-          { icon: <Orbit className="w-3.5 h-3.5 text-purple-400" />, label: 'Left↔Right Edge Warp' },
-          { icon: <Wind className="w-3.5 h-3.5 text-amber-300" />, label: '0.78× Low Gravity' },
+          { icon: <Orbit className="w-3.5 h-3.5 text-purple-400" />, label: 'Compact 430px Warp Cage' },
+          { icon: <Wind className="w-3.5 h-3.5 text-amber-300" />, label: '0.78× Low Gravity + Pendulum' },
         ];
       case 'train':
         return [
-          { icon: <Train className="w-3.5 h-3.5 text-sky-400" />, label: 'Twin Bullet Cars' },
-          { icon: <Wind className="w-3.5 h-3.5 text-amber-400" />, label: 'Slipstream Wind Gust' },
+          { icon: <Train className="w-3.5 h-3.5 text-sky-400" />, label: '920px 3-Car Bullet Train' },
+          { icon: <Wind className="w-3.5 h-3.5 text-amber-400" />, label: 'Catenary Decks + Wind Gusts' },
         ];
     }
   };
@@ -398,8 +410,10 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
       {/* Top Broadcast Navigation & 2-Step Progress Bar */}
       <header className="flex items-center justify-between gap-4 px-5 sm:px-8 py-2.5 border-b border-slate-800/90 bg-[#090d18]/95 shrink-0">
         <button
+          onMouseEnter={() => sound.playUiHover()}
           onClick={() => {
             sound.unlock();
+            sound.playUiBack();
             if (setupStep === 'stage') {
               setSetupStep('fighters');
             } else {
@@ -415,7 +429,12 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
         {/* Interactive 2-Step Progress Switcher */}
         <div className="flex items-center gap-2">
           <button
-            onClick={() => setSetupStep('fighters')}
+            onMouseEnter={() => sound.playUiHover()}
+            onClick={() => {
+              sound.unlock();
+              sound.playUiClick();
+              setSetupStep('fighters');
+            }}
             className={`clip-slant flex items-center gap-2 px-4 py-1.5 text-xs font-bold uppercase tracking-wider transition-all cursor-pointer ${
               setupStep === 'fighters'
                 ? 'bg-amber-400 text-slate-950 shadow-[0_0_16px_rgba(245,158,11,0.35)]'
@@ -429,7 +448,12 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
           <ArrowRight className="w-3.5 h-3.5 text-slate-600 hidden sm:block" />
 
           <button
-            onClick={() => setSetupStep('stage')}
+            onMouseEnter={() => sound.playUiHover()}
+            onClick={() => {
+              sound.unlock();
+              sound.playUiClick();
+              setSetupStep('stage');
+            }}
             className={`clip-slant flex items-center gap-2 px-4 py-1.5 text-xs font-bold uppercase tracking-wider transition-all cursor-pointer ${
               setupStep === 'stage'
                 ? 'bg-amber-400 text-slate-950 shadow-[0_0_16px_rgba(245,158,11,0.35)]'
@@ -444,6 +468,7 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
         {/* Right Actions: Randomize + Primary Step Action */}
         <div className="flex items-center gap-2.5">
           <button
+            onMouseEnter={() => sound.playUiHover()}
             onClick={randomizeCurrentStep}
             className="clip-corner-sm flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold uppercase text-slate-200 bg-slate-900 border border-slate-700 hover:border-amber-400 transition-colors cursor-pointer"
             title="Randomize Selection"
@@ -456,9 +481,10 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
             <motion.button
               whileHover={{ scale: 1.02 }}
               whileTap={{ scale: 0.97 }}
+              onMouseEnter={() => sound.playUiHover()}
               onClick={() => {
                 sound.unlock();
-                sound.playSwing(1.05, false);
+                sound.playUiConfirm();
                 setSetupStep('stage');
               }}
               className="clip-blade-r flex items-center gap-2 px-5 py-1.5 text-sm font-display font-bold tracking-wider uppercase text-slate-950 bg-amber-400 hover:bg-amber-300 transition-colors cursor-pointer shadow-md shadow-amber-500/20"
@@ -470,8 +496,10 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
             <motion.button
               whileHover={{ scale: 1.02 }}
               whileTap={{ scale: 0.97 }}
+              onMouseEnter={() => sound.playUiHover()}
               onClick={() => {
                 sound.unlock();
+                sound.playUiConfirm();
                 onStartFight();
               }}
               className="clip-blade-r flex items-center gap-2 px-6 py-1.5 text-sm font-display font-bold tracking-wider uppercase text-slate-950 bg-gradient-to-r from-amber-400 to-yellow-300 hover:from-amber-300 hover:to-yellow-200 transition-colors cursor-pointer shadow-md shadow-amber-500/25"
@@ -495,7 +523,12 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
               {/* P1 vs P2 Slot Selector Cards */}
               <div className="grid grid-cols-2 gap-3 shrink-0">
                 <button
-                  onClick={() => setSelectingSlot('p1')}
+                  onMouseEnter={() => sound.playUiHover()}
+                  onClick={() => {
+                    sound.unlock();
+                    sound.playUiToggle(true);
+                    setSelectingSlot('p1');
+                  }}
                   className={`clip-corner-sm relative flex items-center gap-3 p-2.5 border text-left transition-all cursor-pointer ${
                     selectingSlot === 'p1'
                       ? 'bg-[#12192e] border-amber-400 shadow-[0_0_20px_rgba(245,158,11,0.18)]'
@@ -522,7 +555,12 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
                 </button>
 
                 <button
-                  onClick={() => setSelectingSlot('p2')}
+                  onMouseEnter={() => sound.playUiHover()}
+                  onClick={() => {
+                    sound.unlock();
+                    sound.playUiToggle(false);
+                    setSelectingSlot('p2');
+                  }}
                   className={`clip-corner-sm relative flex items-center gap-3 p-2.5 border text-left transition-all cursor-pointer ${
                     selectingSlot === 'p2'
                       ? 'bg-[#1b1120] border-rose-500 shadow-[0_0_20px_rgba(244,63,94,0.2)]'
@@ -748,9 +786,10 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
                     key={f.id}
                     whileHover={{ y: -2 }}
                     whileTap={{ scale: 0.97 }}
+                    onMouseEnter={() => sound.playUiHover()}
                     onClick={() => {
                       sound.unlock();
-                      sound.playSwing(1.15, false);
+                      sound.playUiSelectFighter(f.id as FighterId);
                       if (selectingSlot === 'p1') {
                         update({ p1Fighter: f.id as FighterId });
                       } else {
@@ -808,9 +847,10 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
             <motion.button
               whileHover={{ scale: 1.02 }}
               whileTap={{ scale: 0.98 }}
+              onMouseEnter={() => sound.playUiHover()}
               onClick={() => {
                 sound.unlock();
-                sound.playSwing(1.0, true);
+                sound.playUiConfirm();
                 setSetupStep('stage');
               }}
               className="clip-blade-r px-6 py-3 sm:py-0 flex items-center justify-center gap-2 font-display text-2xl font-bold uppercase tracking-wider text-slate-950 bg-amber-400 hover:bg-amber-300 transition-colors cursor-pointer shrink-0 shadow-lg shadow-amber-500/20"
@@ -895,7 +935,12 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
                     return (
                       <button
                         key={r.id}
-                        onClick={() => update({ ruleset: r.id })}
+                        onMouseEnter={() => sound.playUiHover()}
+                        onClick={() => {
+                          sound.unlock();
+                          sound.playUiToggle(r.id === 'stock');
+                          update({ ruleset: r.id });
+                        }}
                         className={`clip-corner-sm p-2.5 text-left border transition-all cursor-pointer ${
                           active
                             ? 'bg-[#161f38] border-amber-400 text-slate-50 shadow-md'
@@ -929,7 +974,12 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
                           return (
                             <button
                               key={cnt}
-                              onClick={() => update({ stocksCount: cnt })}
+                              onMouseEnter={() => sound.playUiHover()}
+                              onClick={() => {
+                                sound.unlock();
+                                sound.playUiClick();
+                                update({ stocksCount: cnt });
+                              }}
                               className={`clip-corner-sm py-2 px-1 flex flex-col items-center gap-1 border transition-colors cursor-pointer ${
                                 active
                                   ? 'bg-amber-400/20 border-amber-400 text-amber-300'
@@ -970,7 +1020,12 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
                         return (
                           <button
                             key={d.id}
-                            onClick={() => update({ aiDifficulty: d.id })}
+                            onMouseEnter={() => sound.playUiHover()}
+                            onClick={() => {
+                              sound.unlock();
+                              sound.playUiClick();
+                              update({ aiDifficulty: d.id });
+                            }}
                             className={`clip-corner-sm py-2 px-1 flex flex-col items-center gap-1 border transition-colors cursor-pointer ${
                               active
                                 ? 'bg-rose-500/20 border-rose-500 text-rose-300'
@@ -1011,7 +1066,12 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
                   </div>
 
                   <button
-                    onClick={() => setSetupStep('fighters')}
+                    onMouseEnter={() => sound.playUiHover()}
+                    onClick={() => {
+                      sound.unlock();
+                      sound.playUiBack();
+                      setSetupStep('fighters');
+                    }}
                     className="px-2.5 py-1 text-[10px] font-mono-num font-bold uppercase bg-slate-900 border border-slate-700 text-slate-300 hover:border-amber-400 hover:text-amber-300 cursor-pointer"
                   >
                     Change Fighters
@@ -1033,8 +1093,10 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
                 <motion.button
                   whileHover={{ scale: 1.01 }}
                   whileTap={{ scale: 0.98 }}
+                  onMouseEnter={() => sound.playUiHover()}
                   onClick={() => {
                     sound.unlock();
+                    sound.playUiConfirm();
                     onStartFight();
                   }}
                   className="clip-blade-r w-full py-3 flex items-center justify-center gap-3 font-display text-3xl font-bold tracking-wider uppercase text-slate-950 bg-gradient-to-r from-amber-400 via-amber-300 to-yellow-300 hover:from-amber-300 hover:to-yellow-200 transition-all cursor-pointer shadow-[0_0_28px_rgba(245,158,11,0.3)]"
@@ -1056,9 +1118,10 @@ export const MatchSetup: React.FC<MatchSetupProps> = ({
                     key={s.id}
                     whileHover={{ y: -2 }}
                     whileTap={{ scale: 0.98 }}
+                    onMouseEnter={() => sound.playUiHover()}
                     onClick={() => {
                       sound.unlock();
-                      sound.playSwing(1.15, false);
+                      sound.playUiSelectStage(s.id as StageId);
                       update({ stageId: s.id as StageId });
                     }}
                     className={`clip-corner-sm relative p-2 text-left border transition-all cursor-pointer overflow-hidden ${

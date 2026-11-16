@@ -102,6 +102,10 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({ onSelectMode }) => {
     const next = !muted;
     sound.setMuted(next);
     setMuted(next);
+    if (!next) {
+      sound.unlock();
+      sound.playUiToggle(true);
+    }
   };
 
   return (
@@ -127,14 +131,16 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({ onSelectMode }) => {
             <span className="w-1.5 h-6 bg-rose-500" />
           </div>
           <span className="font-display text-3xl font-bold tracking-wider text-slate-50 uppercase leading-none">
-            INKBLITZ
+            ZANSHIN
           </span>
         </div>
 
         <div className="flex items-center gap-2.5">
           <button
+            onMouseEnter={() => sound.playUiHover()}
             onClick={() => {
               sound.unlock();
+              sound.playUiClick();
               setShowControls(true);
             }}
             className="clip-corner-sm flex items-center gap-2 px-4 py-2 text-xs font-bold uppercase tracking-wider text-slate-100 bg-[#0c101d]/90 border border-slate-700/80 hover:border-amber-400 hover:text-amber-300 transition-all cursor-pointer"
@@ -172,12 +178,12 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({ onSelectMode }) => {
             </div>
 
             <h1 className="font-display text-7xl sm:text-9xl font-bold tracking-tight uppercase leading-[0.82] italic text-slate-50 drop-shadow-[0_10px_28px_rgba(0,0,0,0.85)]">
-              AETHER
+              ZANSHIN
               <span
                 className="block not-italic transition-colors duration-300"
                 style={{ color: stageSpec.accentColor }}
               >
-                CHRONICLES
+                INK DUELISTS
               </span>
             </h1>
           </div>
@@ -187,9 +193,10 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({ onSelectMode }) => {
             <motion.button
               whileHover={{ x: 5, scale: 1.02 }}
               whileTap={{ scale: 0.98 }}
+              onMouseEnter={() => sound.playUiHover()}
               onClick={() => {
                 sound.unlock();
-                sound.playSwing(1.0, true);
+                sound.playUiConfirm();
                 onSelectMode('vs_ai');
               }}
               className="clip-blade-r group relative flex items-center justify-between gap-7 px-8 py-4 text-slate-950 bg-gradient-to-r from-amber-400 via-amber-300 to-yellow-300 hover:from-amber-300 hover:to-yellow-200 cursor-pointer shadow-[0_0_32px_rgba(245,158,11,0.3)]"
@@ -213,9 +220,10 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({ onSelectMode }) => {
             <motion.button
               whileHover={{ x: 5, scale: 1.02 }}
               whileTap={{ scale: 0.98 }}
+              onMouseEnter={() => sound.playUiHover()}
               onClick={() => {
                 sound.unlock();
-                sound.playSwing(1.15, false);
+                sound.playUiConfirm();
                 onSelectMode('training');
               }}
               className="clip-blade-r group flex items-center justify-between gap-6 px-7 py-4 text-slate-100 bg-[#0c101d]/90 border border-slate-700/90 hover:border-sky-400 cursor-pointer backdrop-blur-xs"
@@ -260,7 +268,12 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({ onSelectMode }) => {
             return (
               <button
                 key={s.id}
-                onClick={() => setBgStageId(s.id)}
+                onMouseEnter={() => sound.playUiHover()}
+                onClick={() => {
+                  sound.unlock();
+                  sound.playUiSelectStage(s.id);
+                  setBgStageId(s.id);
+                }}
                 title={`${s.name} — ${s.tag}`}
                 className={`h-2.5 -skew-x-12 transition-all cursor-pointer ${
                   active
@@ -300,7 +313,10 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({ onSelectMode }) => {
                   </h2>
                 </div>
                 <button
-                  onClick={() => setShowControls(false)}
+                  onClick={() => {
+                    sound.playUiBack();
+                    setShowControls(false);
+                  }}
                   className="p-1.5 text-slate-400 hover:text-slate-100 cursor-pointer"
                   aria-label="Close controls"
                 >

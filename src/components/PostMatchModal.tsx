@@ -1,6 +1,7 @@
 import React from 'react';
 import { Flame, Home, RotateCcw, Shield, Swords, Trophy, Users } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
+import { sound } from '../game/audio';
 import { FIGHTERS } from '../game/fighters';
 import { HUDState } from '../game/types';
 import { FighterPortrait } from './FighterPortrait';
@@ -79,9 +80,9 @@ export const PostMatchModal: React.FC<PostMatchModalProps> = ({
 
   const subtitle =
     hud.winnerSlot === 0
-      ? 'Player 1 claims the Aether Arena'
+      ? 'Player 1 claims the Zanshin Arena'
       : hud.winnerSlot === 1
-      ? 'AI Challenger claims the Aether Arena'
+      ? 'AI Challenger claims the Zanshin Arena'
       : 'Time expired with equal standing';
 
   return (
@@ -170,7 +171,12 @@ export const PostMatchModal: React.FC<PostMatchModalProps> = ({
 
             <div className="space-y-2.5">
               <button
-                onClick={onRematch}
+                onMouseEnter={() => sound.playUiHover()}
+                onClick={() => {
+                  sound.unlock();
+                  sound.playUiConfirm();
+                  onRematch();
+                }}
                 className="clip-blade-r w-full flex items-center justify-center gap-2 py-2.5 text-xl font-display font-bold uppercase tracking-wider text-slate-950 bg-gradient-to-r from-amber-400 via-yellow-300 to-amber-500 hover:brightness-110 transition-all cursor-pointer"
               >
                 <RotateCcw className="w-4 h-4" />
@@ -178,14 +184,24 @@ export const PostMatchModal: React.FC<PostMatchModalProps> = ({
               </button>
               <div className="grid grid-cols-2 gap-2.5">
                 <button
-                  onClick={onChangeFighters}
+                  onMouseEnter={() => sound.playUiHover()}
+                  onClick={() => {
+                    sound.unlock();
+                    sound.playUiBack();
+                    onChangeFighters();
+                  }}
                   className="flex items-center justify-center gap-1.5 py-2.5 text-xs font-mono-num font-bold uppercase text-slate-200 bg-slate-900 border border-slate-700 hover:border-amber-400 transition-colors cursor-pointer"
                 >
                   <Users className="w-3.5 h-3.5" />
                   Switch Fighters
                 </button>
                 <button
-                  onClick={onMainMenu}
+                  onMouseEnter={() => sound.playUiHover()}
+                  onClick={() => {
+                    sound.unlock();
+                    sound.playUiBack();
+                    onMainMenu();
+                  }}
                   className="flex items-center justify-center gap-1.5 py-2.5 text-xs font-mono-num font-bold uppercase text-slate-200 bg-slate-900 border border-slate-700 hover:border-amber-400 transition-colors cursor-pointer"
                 >
                   <Home className="w-3.5 h-3.5" />

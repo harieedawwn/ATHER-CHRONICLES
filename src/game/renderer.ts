@@ -53,6 +53,12 @@ function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
 
+function lerpAngle(a: number, b: number, t: number): number {
+  let diff = ((b - a + Math.PI) % (Math.PI * 2)) - Math.PI;
+  if (diff < -Math.PI) diff += Math.PI * 2;
+  return a + diff * t;
+}
+
 function lerpVec(a: Vec2, b: Vec2, t: number): Vec2 {
   return { x: lerp(a.x, b.x, t), y: lerp(a.y, b.y, t) };
 }
@@ -66,9 +72,14 @@ function easeOutExpo(t: number): number {
   return c >= 1 ? 1 : 1 - Math.pow(2, -10 * c);
 }
 
-function easeInOutQuad(t: number): number {
+function easeOutCubic(t: number): number {
   const c = clamp01(t);
-  return c < 0.5 ? 2 * c * c : 1 - Math.pow(-2 * c + 2, 2) / 2;
+  return 1 - Math.pow(1 - c, 3);
+}
+
+function easeInOutCubic(t: number): number {
+  const c = clamp01(t);
+  return c < 0.5 ? 4 * c * c * c : 1 - Math.pow(-2 * c + 2, 3) / 2;
 }
 
 function blendPose(a: SkeletonPose, b: SkeletonPose, t: number): SkeletonPose {
@@ -88,15 +99,52 @@ function blendPose(a: SkeletonPose, b: SkeletonPose, t: number): SkeletonPose {
     footF: lerpVec(a.footF, b.footF, k),
     kneeB: lerpVec(a.kneeB, b.kneeB, k),
     footB: lerpVec(a.footB, b.footB, k),
-    weaponAngle: lerp(a.weaponAngle, b.weaponAngle, k),
+    weaponAngle: lerpAngle(a.weaponAngle, b.weaponAngle, k),
     weaponReach: lerp(a.weaponReach, b.weaponReach, k),
     offhandWeaponAngle:
       a.offhandWeaponAngle !== undefined && b.offhandWeaponAngle !== undefined
-        ? lerp(a.offhandWeaponAngle, b.offhandWeaponAngle, k)
+        ? lerpAngle(a.offhandWeaponAngle, b.offhandWeaponAngle, k)
         : b.offhandWeaponAngle ?? a.offhandWeaponAngle,
     sheathed: k < 0.5 ? a.sheathed : b.sheathed,
     smearAlpha: lerp(a.smearAlpha ?? 0, b.smearAlpha ?? 0, k),
     smearSpan: lerp(a.smearSpan ?? 0, b.smearSpan ?? 0, k),
+  };
+}
+
+// Staggered Kinetic-Chain & Circular Arc Swing Blender (Hip -> Torso -> Shoulder -> Elbow -> Hand/Weapon)
+function blendStrikeSwingPose(windup: SkeletonPose, strike: SkeletonPose, t: number): SkeletonPose {
+  const k = clamp01(t);
+  // Core (hips & spine) leads the kinetic chain early; weapon arm whips through with an arc
+  const bodyK = easeOutCubic(Math.min(1, k * 1.18));
+  const armK = easeInOutCubic(k);
+  const arcBell = Math.sin(k * Math.PI);
+  const dy = strike.handF.y - windup.handF.y;
+  const arcLiftY = dy < -4 ? -arcBell * 4.5 : dy > 4 ? -arcBell * 5.2 : -arcBell * 3.4;
+  const arcOutX = arcBell * 3.8;
+
+  const baseBlend = blendPose(windup, strike, armK);
+  return {
+    ...baseBlend,
+    hip: lerpVec(windup.hip, strike.hip, bodyK),
+    spine: lerpVec(windup.spine, strike.spine, bodyK),
+    chest: lerpVec(windup.chest, strike.chest, bodyK),
+    head: lerpVec(windup.head, strike.head, bodyK),
+    kneeF: lerpVec(windup.kneeF, strike.kneeF, bodyK),
+    footF: lerpVec(windup.footF, strike.footF, bodyK),
+    kneeB: lerpVec(windup.kneeB, strike.kneeB, bodyK),
+    footB: lerpVec(windup.footB, strike.footB, bodyK),
+    shoulderF: {
+      x: baseBlend.shoulderF.x + arcOutX * 0.35,
+      y: baseBlend.shoulderF.y + arcLiftY * 0.35,
+    },
+    elbowF: {
+      x: baseBlend.elbowF.x + arcOutX * 0.7,
+      y: baseBlend.elbowF.y + arcLiftY * 0.75,
+    },
+    handF: {
+      x: baseBlend.handF.x + arcOutX,
+      y: baseBlend.handF.y + arcLiftY,
+    },
   };
 }
 
@@ -117,6 +165,9 @@ export interface RenderSceneData {
   camY: number;
   camZoom: number;
   camAngle?: number;
+  camYaw?: number;
+  camPitch?: number;
+  ultBackdropMode?: 'none' | 'stage25d' | 'speedlines' | 'impact_bw' | 'climax_flash';
   shakeX: number;
   shakeY: number;
   impactFrames: number;
@@ -129,6 +180,10 @@ export interface RenderSceneData {
 export class HDPixelRenderer {
   private buffer: HTMLCanvasElement;
   private bctx: CanvasRenderingContext2D;
+  private smoothedPoses = new Map<
+    number,
+    { pose: SkeletonPose; x: number; y: number; facing: 1 | -1; tick: number }
+  >();
 
   constructor() {
     this.buffer = document.createElement('canvas');
@@ -146,14 +201,20 @@ export class HDPixelRenderer {
     ctx.globalAlpha = 1;
     ctx.imageSmoothingEnabled = false;
 
-    // 1. Background & Parallax Stage
+    const has25DUltBackdrop =
+      scene.ultBackdropMode !== undefined && scene.ultBackdropMode !== 'none';
+
+    // 1. Background & Parallax Stage (or Full 2.5D Perspective Stage / Speed-Line Backdrop during Ultimates)
     if (scene.impactFrames > 0) {
       this.drawImpactBackground(ctx, scene.impactInverted, scene.tick);
+    } else if (has25DUltBackdrop) {
+      this.drawParallaxStage(ctx, scene);
+      this.drawUltimate25DBackdrop(ctx, scene);
     } else {
       this.drawParallaxStage(ctx, scene);
     }
 
-    // 2. World-space Camera Transform (with dynamic Dutch Angle rotation during Ultimates!)
+    // 2. World-space Camera Transform (with 2.5D camera banking & zoom)
     ctx.save();
     ctx.translate(
       Math.round(RENDER_W * 0.5 + scene.shakeX),
@@ -165,8 +226,10 @@ export class HDPixelRenderer {
     ctx.scale(scene.camZoom, scene.camZoom);
     ctx.translate(-scene.camX, -scene.camY);
 
-    // 3. Stage Platforms, Jump Pads & Spatial Boundaries
-    this.drawPlatforms(ctx, scene.stage, scene.impactFrames > 0, scene.tick);
+    // 3. Stage Platforms, Jump Pads & Spatial Boundaries (hidden during aerial sky-chase speedlines for pure 2.5D clarity)
+    if (scene.ultBackdropMode !== 'speedlines' && scene.ultBackdropMode !== 'impact_bw') {
+      this.drawPlatforms(ctx, scene.stage, scene.impactFrames > 0, scene.tick);
+    }
 
     // 4. Ground / Anchor / Rift Seals / Stasis Fields / Portals
     for (const f of scene.fighters) {
@@ -197,9 +260,16 @@ export class HDPixelRenderer {
     // 6. Kenji Observation Foresight Rings
     this.drawObservationForesight(ctx, scene.fighters, scene.tick);
 
-    // 7. Fighters
-    for (const f of scene.fighters) {
-      this.drawFighter(ctx, f, scene.impactFrames > 0, scene.impactInverted, scene.tick);
+    // 7. Fighters (Sorted by 2.5D Z-depth so foreground fighter renders cleanly in front of background fighter!)
+    const sortedFighters = [...scene.fighters].sort((a, b) => (b.z ?? 0) - (a.z ?? 0));
+    for (const f of sortedFighters) {
+      this.drawFighter(
+        ctx,
+        f,
+        scene.impactFrames > 0 || scene.ultBackdropMode === 'impact_bw',
+        scene.impactInverted,
+        scene.tick
+      );
     }
 
     // 8. Delayed Anime Slash Cuts (Velo)
@@ -220,8 +290,14 @@ export class HDPixelRenderer {
       this.drawShockwave(ctx, sw);
     }
 
-    // 10.5. Character-Specific Ultimate World Spectacles (Telegraphs & Cataclysms)
-    this.drawUltimateWorldSpectacle(ctx, scene.fighters, scene.tick);
+    // 10.5. Crystal-Clear 2.5D Martial & Weapon Ultimate FX (No obscuring circles or dark filters!)
+    this.drawUltimate25DActionFX(
+      ctx,
+      scene.fighters,
+      scene.tick,
+      scene.camYaw ?? 0,
+      scene.camPitch ?? 0
+    );
 
     // 11. Particles (Sparks, 4-Point Flares, Debris, Wind Cones)
     for (const pt of scene.particles) {
@@ -331,263 +407,376 @@ export class HDPixelRenderer {
     ctx.restore();
   }
 
-  private drawUltimateWorldSpectacle(
+  private drawUltimate25DBackdrop(
+    ctx: CanvasRenderingContext2D,
+    scene: RenderSceneData
+  ): void {
+    const caster = scene.fighters.find((f) => f.action === 'ultimate');
+    if (!caster) return;
+    const mode = scene.ultBackdropMode ?? 'stage25d';
+    const yaw = scene.camYaw ?? 0;
+    const pitch = scene.camPitch ?? 0;
+    const tick = scene.tick;
+    const accent = caster.spec.accentColor;
+    const secondary = caster.spec.secondaryColor;
+
+    ctx.save();
+
+    if (mode === 'impact_bw') {
+      // High-Contrast Anime Impact Frame Backdrop (Behind fighters, 100% razor-sharp silhouette readability)
+      const inv = tick % 4 < 2;
+      ctx.fillStyle = inv ? '#f8fafc' : '#05070d';
+      ctx.fillRect(0, 0, RENDER_W, RENDER_H);
+
+      ctx.translate(RENDER_W * 0.5 + yaw * 80, RENDER_H * 0.45 + pitch * 60);
+      ctx.strokeStyle = inv ? '#05070d' : accent;
+      for (let i = 0; i < 44; i++) {
+        const ang = (i / 44) * Math.PI * 2 + (tick % 3) * 0.04;
+        ctx.lineWidth = i % 3 === 0 ? 4.2 : 1.8;
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(ang) * 48, Math.sin(ang) * 48);
+        ctx.lineTo(Math.cos(ang) * 540, Math.sin(ang) * 540);
+        ctx.stroke();
+      }
+      ctx.restore();
+      return;
+    }
+
+    if (mode === 'speedlines') {
+      // Act IV Aerial Sky-Chase & Climax Pose: Dynamic 2.5D Diagonal Speed-Line Tunnel
+      const skyGrad = ctx.createLinearGradient(0, 0, 0, RENDER_H);
+      skyGrad.addColorStop(0, '#040711');
+      skyGrad.addColorStop(0.5, '#0b1329');
+      skyGrad.addColorStop(1, '#111c38');
+      ctx.fillStyle = skyGrad;
+      ctx.fillRect(0, 0, RENDER_W, RENDER_H);
+
+      // Perspective vanishing point shifts dynamically with 2.5D camYaw & camPitch
+      const vx = RENDER_W * 0.5 - yaw * 240;
+      const vy = RENDER_H * 0.36 + pitch * 190;
+
+      // Subtle glowing horizon core in the distance (never obscuring foreground fighters)
+      const rad = ctx.createRadialGradient(vx, vy, 8, vx, vy, 340);
+      rad.addColorStop(0, `${accent}44`);
+      rad.addColorStop(0.55, `${secondary}22`);
+      rad.addColorStop(1, 'rgba(4, 7, 17, 0)');
+      ctx.fillStyle = rad;
+      ctx.fillRect(0, 0, RENDER_W, RENDER_H);
+
+      // 3D Perspective Speed-Line Tunnel radiating from vanishing point
+      for (let i = 0; i < 48; i++) {
+        const ang = (i / 48) * Math.PI * 2 + yaw * 0.35;
+        const speedOffset = ((tick * 28 + i * 47) % 380) + 75;
+        const r1 = speedOffset;
+        const r2 = speedOffset + 95 + (i % 3) * 35;
+        ctx.strokeStyle = i % 3 === 0 ? accent : i % 2 === 0 ? secondary : '#e2e8f0';
+        ctx.globalAlpha = i % 3 === 0 ? 0.55 : 0.28;
+        ctx.lineWidth = i % 4 === 0 ? 2.6 : 1.3;
+        ctx.beginPath();
+        ctx.moveTo(vx + Math.cos(ang) * r1, vy + Math.sin(ang) * r1);
+        ctx.lineTo(vx + Math.cos(ang) * r2, vy + Math.sin(ang) * r2);
+        ctx.stroke();
+      }
+
+      // Receding 3D speed rings in depth
+      ctx.globalAlpha = 0.22;
+      ctx.strokeStyle = accent;
+      ctx.lineWidth = 1.5;
+      for (let r = 0; r < 4; r++) {
+        const ringR = ((tick * 9 + r * 95) % 380) + 40;
+        ctx.beginPath();
+        ctx.ellipse(vx, vy, ringR * 1.35, ringR * 0.78, yaw * 0.25, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      ctx.restore();
+      return;
+    }
+
+    // Default 'stage25d' or 'climax_flash': Full 2.5D Perspective Stage Floor & Horizon Grid
+    const horizonY = Math.round(
+      Math.max(135, Math.min(340, RENDER_H * 0.56 - pitch * 210))
+    );
+    const vanishX = Math.round(RENDER_W * 0.5 - yaw * 310);
+
+    // 1. Crisp 2.5D Perspective Floor Plane from horizonY to bottom of screen
+    const floorGrad = ctx.createLinearGradient(0, horizonY, 0, RENDER_H);
+    floorGrad.addColorStop(0, '#070b16');
+    floorGrad.addColorStop(0.35, '#0d1528');
+    floorGrad.addColorStop(1, '#050811');
+    ctx.fillStyle = floorGrad;
+    ctx.fillRect(0, horizonY, RENDER_W, RENDER_H - horizonY);
+
+    // 2. Perspective Longitudinal 3D Floor Lines converging at (vanishX, horizonY)
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, horizonY, RENDER_W, RENDER_H - horizonY);
+    ctx.clip();
+
+    const numRays = 22;
+    for (let i = -numRays; i <= numRays; i++) {
+      const bottomX = vanishX + i * 95 + yaw * 180;
+      ctx.strokeStyle = i % 4 === 0 ? accent : '#334155';
+      ctx.globalAlpha = i % 4 === 0 ? 0.5 : 0.26;
+      ctx.lineWidth = i % 4 === 0 ? 1.8 : 1.0;
+      ctx.beginPath();
+      ctx.moveTo(vanishX, horizonY);
+      ctx.lineTo(bottomX, RENDER_H + 40);
+      ctx.stroke();
+    }
+
+    // 3. Foreshortened Horizontal 3D Depth Tile Lines ($y(z)$ quadratic spacing)
+    const floorH = RENDER_H - horizonY;
+    for (let d = 1; d <= 12; d++) {
+      const norm = d / 12;
+      const perspT = Math.pow(norm, 1.85);
+      const rowY = Math.round(horizonY + perspT * floorH);
+      ctx.strokeStyle = d % 3 === 0 ? secondary : '#1e293b';
+      ctx.globalAlpha = (0.18 + perspT * 0.42) * (mode === 'climax_flash' ? 1.3 : 1);
+      ctx.lineWidth = d >= 9 ? 2.0 : 1.1;
+      ctx.beginPath();
+      ctx.moveTo(0, rowY);
+      ctx.lineTo(RENDER_W, rowY);
+      ctx.stroke();
+    }
+
+    // 4. 3D Parallax Background Monoliths / Stage Pillars rotating with camYaw
+    for (let p = -4; p <= 4; p++) {
+      if (p === 0) continue;
+      const colX = Math.round(vanishX + p * 145 - yaw * 160);
+      const colW = Math.round(14 + Math.abs(p) * 3);
+      const colH = Math.round(68 + Math.abs(p) * 18);
+      ctx.globalAlpha = 0.28;
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(colX - colW * 0.5, horizonY - colH, colW, colH);
+      ctx.strokeStyle = accent;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(colX - colW * 0.5, horizonY - colH, colW, colH);
+    }
+    ctx.restore();
+
+    // 5. Glowing 2.5D Horizon Rim Line
+    ctx.strokeStyle = mode === 'climax_flash' ? '#fde047' : accent;
+    ctx.globalAlpha = mode === 'climax_flash' ? 0.85 : 0.65;
+    ctx.lineWidth = mode === 'climax_flash' ? 2.5 : 1.6;
+    ctx.beginPath();
+    ctx.moveTo(0, horizonY);
+    ctx.lineTo(RENDER_W, horizonY);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  private drawUltimate25DActionFX(
     ctx: CanvasRenderingContext2D,
     fighters: [FighterState, FighterState],
-    tick: number
+    tick: number,
+    camYaw: number,
+    camPitch: number
   ): void {
-    for (const f of fighters) {
+    for (let i = 0; i < 2; i++) {
+      const f = fighters[i];
       if (f.action !== 'ultimate') continue;
+      const foe = fighters[1 - i];
       const af = f.actionFrame;
-      const zx = f.anchorX;
-      const zy = f.anchorY;
+      const accent = f.spec.accentColor;
+      const secondary = f.spec.secondaryColor;
 
       ctx.save();
       try {
-        // 1. Cutscene Awakening Pillar on Caster (Frames 1..44)
-        if (af <= 44) {
-          const pRatio = af / 44;
-          ctx.strokeStyle = f.spec.secondaryColor;
-          ctx.lineWidth = 2.5;
-          ctx.globalAlpha = 0.75;
-          ctx.beginPath();
-          ctx.arc(f.x, f.y - 12, 18 + Math.sin(tick * 0.4) * 6 + pRatio * 18, 0, Math.PI * 2);
-          ctx.stroke();
-
-          // Rising awakening rings
+        // =====================================================================
+        // ACT I (Frames 1..60): LOW-ANGLE 2.5D HERO STANCE & FLOOR SHOCK-RINGS
+        // =====================================================================
+        if (af <= 60) {
+          const prog = af / 60;
+          // 2.5D foreshortened ground pressure ellipses under caster's feet (NO screen-covering shapes!)
           for (let r = 0; r < 3; r++) {
-            const ry = f.y + 16 - ((af * 2.2 + r * 18) % 52);
-            ctx.strokeStyle = r % 2 === 0 ? '#fde047' : f.spec.accentColor;
+            const ringProg = ((prog * 3 + r * 0.33) % 1);
+            const rx = 18 + ringProg * 68;
+            const ry = Math.max(4, rx * (0.26 + Math.abs(camPitch) * 0.25));
+            ctx.strokeStyle = r % 2 === 0 ? accent : secondary;
+            ctx.globalAlpha = (1 - ringProg) * 0.85;
+            ctx.lineWidth = 2.2 - ringProg * 1.4;
+            ctx.beginPath();
+            ctx.ellipse(f.x, f.y + 2, rx, ry, camYaw * 0.2, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+
+          // Vertical rising aura wisps around the fighter's boots & weapon only
+          for (let w = 0; w < 6; w++) {
+            const wx = f.x + Math.sin(tick * 0.25 + w * 1.1) * 24;
+            const wy = f.y - ((tick * 4 + w * 13) % 52);
+            ctx.strokeStyle = w % 2 === 0 ? '#ffffff' : accent;
+            ctx.globalAlpha = 0.75;
             ctx.lineWidth = 1.8;
             ctx.beginPath();
-            ctx.ellipse(f.x, ry, 22 - r * 3, 5, 0, 0, Math.PI * 2);
+            ctx.moveTo(wx, wy + 10);
+            ctx.lineTo(wx, wy);
             ctx.stroke();
           }
-        } else if (af >= 45 && af <= 82) {
-          // 2. Telegraph & Evasion Window (Frames 45..82) — Distinct Danger Zone + Character Construct!
-          const tProg = (af - 45) / 37; // 0 -> 1 as detonation approaches
-          const pulse = 0.55 + Math.sin(tick * 0.65) * 0.35;
-          let halfW = 86;
-          let halfH = 74;
-          if (f.id === 'kenji' || f.id === 'raijin') {
-            halfW = 108;
-            halfH = 64;
-          } else if (f.id === 'velo' || f.id === 'chrono') {
-            halfW = 78;
-            halfH = 82;
+
+          // At frame 32+: crisp weapon glint at hand position
+          if (af >= 32) {
+            const gx = f.x + f.facing * 16;
+            const gy = f.y - 18;
+            const glintR = 14 + Math.sin(af * 0.6) * 5;
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 2.2;
+            ctx.beginPath();
+            ctx.moveTo(gx - glintR, gy);
+            ctx.lineTo(gx + glintR, gy);
+            ctx.moveTo(gx, gy - glintR);
+            ctx.lineTo(gx, gy + glintR);
+            ctx.stroke();
           }
+          continue;
+        }
 
-          // Unblockable Danger Zone Perimeter Box & Fill
-          ctx.fillStyle = `rgba(239, 68, 68, ${0.11 + tProg * 0.16})`;
-          ctx.fillRect(zx - halfW, zy - halfH, halfW * 2, halfH * 2);
-          ctx.strokeStyle = tick % 4 < 2 ? '#ef4444' : '#fde047';
-          ctx.lineWidth = 2;
-          ctx.setLineDash([8, 5]);
-          ctx.strokeRect(zx - halfW, zy - halfH, halfW * 2, halfH * 2);
-          ctx.setLineDash([]);
-
-          // Shrinking Lock-On Countdown Ring inside the Danger Zone
-          ctx.strokeStyle = f.spec.secondaryColor;
-          ctx.lineWidth = 2.2;
+        // =====================================================================
+        // ACT II (Frames 61..126): HIGH-SPEED 2.5D PURSUIT RUSH CONE & STEP SPARKS
+        // =====================================================================
+        if (af <= 126 && !f.moveHitConnected) {
+          // Aerodynamic Mach shock-cone at chest/weapon tip + ground dust trail
+          const tipX = f.x + f.facing * 24;
+          const tipY = f.y - 16;
+          ctx.strokeStyle = accent;
           ctx.globalAlpha = 0.85;
+          ctx.lineWidth = 2.4;
           ctx.beginPath();
-          ctx.arc(zx, zy, Math.max(8, (1 - tProg) * 68), 0, Math.PI * 2);
+          ctx.moveTo(tipX, tipY);
+          ctx.lineTo(tipX - f.facing * 44, tipY - 18);
+          ctx.moveTo(tipX, tipY);
+          ctx.lineTo(tipX - f.facing * 44, tipY + 18);
           ctx.stroke();
 
-          // Character-Specific Telegraph Visuals
-          if (f.id === 'kuro') {
-            // Giant Blood-Moon Eclipse & Phantom Grim Reaper Scythe hovering above zone
-            ctx.fillStyle = 'rgba(168, 85, 247, 0.28)';
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 1.5;
+          for (let s = 0; s < 5; s++) {
+            const sx = f.x - f.facing * (12 + s * 16 + (tick % 9));
+            const sy = f.y - 6 - (s % 3) * 11;
             ctx.beginPath();
-            ctx.arc(zx, zy - 46, 36, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.strokeStyle = '#e879f9';
-            ctx.lineWidth = 3;
-            ctx.beginPath();
-            ctx.arc(zx, zy - 46, 44, -Math.PI * 0.8, Math.PI * 0.2);
+            ctx.moveTo(sx, sy);
+            ctx.lineTo(sx - f.facing * 22, sy);
             ctx.stroke();
-          } else if (f.id === 'velo') {
-            // Orbital Laser Lock-On Crosshair & Diagonal Re-entry Vector Line
-            ctx.strokeStyle = '#06b6d4';
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.moveTo(f.x, f.y);
-            ctx.lineTo(zx, zy);
-            ctx.stroke();
-            ctx.strokeStyle = '#facc15';
-            ctx.beginPath();
-            ctx.ellipse(zx, zy + 12, 54, 14, 0, 0, Math.PI * 2);
-            ctx.stroke();
-          } else if (f.id === 'kenji') {
-            // Conqueror Haki Black-Crimson Sever Horizon Line
-            ctx.strokeStyle = tick % 2 === 0 ? '#ef4444' : '#090d16';
-            ctx.lineWidth = 3.5;
-            ctx.beginPath();
-            ctx.moveTo(zx - halfW - 14, zy);
-            ctx.lineTo(zx + halfW + 14, zy);
-            ctx.stroke();
-          } else if (f.id === 'bram') {
-            // Event Horizon Black Hole Singularity Core
-            ctx.fillStyle = '#05070d';
-            ctx.beginPath();
-            ctx.arc(zx, zy, 18 + Math.sin(tick * 0.5) * 3, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.strokeStyle = '#10b981';
-            ctx.lineWidth = 2.8;
-            ctx.stroke();
-          } else if (f.id === 'raijin') {
-            // 4 Celestial Thunder Pillar Target Markers
-            for (let p = -1.5; p <= 1.5; p += 1) {
-              const px = zx + p * 54;
-              ctx.strokeStyle = '#facc15';
-              ctx.lineWidth = 1.8;
-              ctx.beginPath();
-              ctx.moveTo(px, zy - 140);
-              ctx.lineTo(px, zy + 24);
-              ctx.stroke();
-            }
-          } else if (f.id === 'chrono') {
-            // Giant XII Golden Cathedral Clockface spinning toward Midnight
-            ctx.strokeStyle = '#fbbf24';
-            ctx.lineWidth = 2.5;
-            ctx.beginPath();
-            ctx.arc(zx, zy, 62, 0, Math.PI * 2);
-            ctx.stroke();
-            const handAng = -Math.PI * 0.5 + tProg * Math.PI * 2;
-            ctx.beginPath();
-            ctx.moveTo(zx, zy);
-            ctx.lineTo(zx + Math.cos(handAng) * 52, zy + Math.sin(handAng) * 52);
-            ctx.moveTo(zx, zy);
-            ctx.lineTo(zx, zy - 38);
-            ctx.stroke();
-          } else if (f.id === 'sol') {
-            // Condensing Miniature Supernova Sun & Phoenix Wings
-            const sunR = 16 + tProg * 28;
-            ctx.fillStyle = 'rgba(249, 115, 22, 0.45)';
-            ctx.beginPath();
-            ctx.arc(zx, zy - 24, sunR + 8, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.fillStyle = '#fde047';
-            ctx.beginPath();
-            ctx.arc(zx, zy - 24, sunR, 0, Math.PI * 2);
-            ctx.fill();
-          } else if (f.id === 'nyx') {
-            // Twin Abyssal Wormhole Gates flanking the target zone
-            for (const side of [-1, 1]) {
-              ctx.strokeStyle = side < 0 ? '#ec4899' : '#38bdf8';
-              ctx.lineWidth = 3;
-              ctx.beginPath();
-              ctx.ellipse(zx + side * 72, zy - 18, 12, 38, side * 0.25, 0, Math.PI * 2);
-              ctx.stroke();
-            }
-          } else if (f.id === 'jin') {
-            // Crimson-Teal Calamity Chakra Web across the zone
-            ctx.strokeStyle = pulse > 0.6 ? '#2dd4bf' : '#f43f5e';
-            ctx.lineWidth = 1.6;
-            for (let w = -3; w <= 3; w++) {
-              ctx.beginPath();
-              ctx.moveTo(f.puppetX, f.puppetY);
-              ctx.lineTo(zx + w * 26, zy + 24);
-              ctx.stroke();
-            }
           }
-        } else if (af >= 83 && af <= 115) {
-          // 3. Cataclysm Detonation Visuals (Frames 83..115)
-          const cProg = (af - 83) / 32;
-          const alpha = Math.max(0, 1 - cProg);
-          ctx.globalAlpha = alpha;
+          continue;
+        }
 
-          if (f.id === 'kuro') {
-            // Colossal Crescent Reaper Guillotine Arc & Underworld Pillars
-            ctx.strokeStyle = '#e879f9';
-            ctx.lineWidth = 14 * alpha;
-            ctx.beginPath();
-            ctx.arc(zx, zy - 10, 82, -Math.PI * 0.85, Math.PI * 0.45);
-            ctx.stroke();
-          } else if (f.id === 'velo') {
-            // Orbital Plasma Meteor Pillar & Mach Shock Cone
-            ctx.fillStyle = '#06b6d4';
-            ctx.fillRect(zx - 32 * alpha, zy - 220, 64 * alpha, 245);
-            ctx.fillStyle = '#ffffff';
-            ctx.fillRect(zx - 14 * alpha, zy - 220, 28 * alpha, 245);
-          } else if (f.id === 'kenji') {
-            // Horizon-Splitting Amaterasu Sever & Criss-Cross Judgment Cuts
-            ctx.strokeStyle = '#ef4444';
-            ctx.lineWidth = 10 * alpha;
-            ctx.beginPath();
-            ctx.moveTo(zx - 140, zy);
-            ctx.lineTo(zx + 140, zy);
-            ctx.stroke();
-            for (let j = -2; j <= 2; j++) {
-              ctx.strokeStyle = j % 2 === 0 ? '#ffffff' : '#f59e0b';
-              ctx.lineWidth = 3 * alpha;
-              ctx.beginPath();
-              ctx.moveTo(zx + j * 38 - 28, zy - 56);
-              ctx.lineTo(zx + j * 38 + 28, zy + 56);
-              ctx.stroke();
+        if (!f.moveHitConnected) continue;
+
+        // =====================================================================
+        // ACT III (Frames 127..306): 6-BEAT MULTI-ANGLE 2.5D MARTIAL & WEAPON COMBO
+        // =====================================================================
+        if (af >= 127 && af <= 306) {
+          const cFrame = af - 127;
+          const beatIdx = Math.min(5, Math.floor(cFrame / 30));
+          const bTick = cFrame - beatIdx * 30;
+
+          // 2.5D Foreshortened Floor Shadow & Combat Ring under the clash point
+          const midX = (f.x + foe.x) * 0.5;
+          const floorY = Math.max(f.y, foe.y) + 2;
+          ctx.strokeStyle = accent;
+          ctx.globalAlpha = 0.48;
+          ctx.lineWidth = 1.8;
+          ctx.beginPath();
+          ctx.ellipse(
+            midX,
+            floorY,
+            56 + Math.sin(cFrame * 0.2) * 8,
+            13 + Math.abs(camPitch) * 12,
+            camYaw * 0.3,
+            0,
+            Math.PI * 2
+          );
+          ctx.stroke();
+
+          // Beat 4 (Earth-Shattering Slam): Cracked 3D Floor Slabs erupting around victim
+          if (beatIdx === 4 && bTick >= 10) {
+            const slamAlpha = Math.max(0, 1 - (bTick - 10) / 20);
+            ctx.save();
+            ctx.globalAlpha = slamAlpha;
+            for (let slab = -3; slab <= 3; slab++) {
+              if (slab === 0) continue;
+              const sx = foe.x + slab * 22;
+              const sy = foe.y + 2 - Math.abs(slab) * 2;
+              ctx.save();
+              ctx.translate(sx, sy);
+              ctx.rotate(slab * 0.18);
+              ctx.fillStyle = '#1e293b';
+              ctx.fillRect(-9, -6, 18, 8);
+              ctx.strokeStyle = accent;
+              ctx.lineWidth = 1.4;
+              ctx.strokeRect(-9, -6, 18, 8);
+              ctx.restore();
             }
-          } else if (f.id === 'bram') {
-            // Tectonic Emerald Spires & Crushed Singularity Dome
-            ctx.fillStyle = '#10b981';
-            for (let s = -2; s <= 2; s++) {
-              const sx = zx + s * 34;
-              const sh = (75 - Math.abs(s) * 12) * alpha;
-              ctx.beginPath();
-              ctx.moveTo(sx - 14, zy + 22);
-              ctx.lineTo(sx, zy + 22 - sh);
-              ctx.lineTo(sx + 14, zy + 22);
-              ctx.closePath();
-              ctx.fill();
-            }
-          } else if (f.id === 'raijin') {
-            // 4 Colossal Celestial Lightning Pillars
-            for (let p = -1.5; p <= 1.5; p += 1) {
-              const px = zx + p * 54;
-              ctx.fillStyle = '#38bdf8';
-              ctx.fillRect(px - 14 * alpha, zy - 220, 28 * alpha, 244);
-              ctx.fillStyle = '#fde047';
-              ctx.fillRect(px - 6 * alpha, zy - 220, 12 * alpha, 244);
-            }
-          } else if (f.id === 'chrono') {
-            // Shattered Golden Stained-Glass Cathedral Clock Shards
-            ctx.strokeStyle = '#fde047';
-            ctx.lineWidth = 3.5 * alpha;
-            for (let k = 0; k < 12; k++) {
-              const ang = (k / 12) * Math.PI * 2;
-              const r = 20 + cProg * 78;
-              ctx.beginPath();
-              ctx.moveTo(zx + Math.cos(ang) * (r - 16), zy + Math.sin(ang) * (r - 16));
-              ctx.lineTo(zx + Math.cos(ang + 0.22) * (r + 14), zy + Math.sin(ang + 0.22) * (r + 14));
-              ctx.stroke();
-            }
-          } else if (f.id === 'sol') {
-            // Towering Phoenix Inferno Pillar
-            ctx.fillStyle = '#f97316';
-            ctx.fillRect(zx - 58 * alpha, zy - 210, 116 * alpha, 236);
-            ctx.fillStyle = '#fde047';
-            ctx.fillRect(zx - 28 * alpha, zy - 210, 56 * alpha, 236);
-          } else if (f.id === 'nyx') {
-            // Intersecting Dimensional Hyper-Beams
-            ctx.strokeStyle = '#ec4899';
-            ctx.lineWidth = 18 * alpha;
-            ctx.beginPath();
-            ctx.moveTo(zx - 82, zy - 58);
-            ctx.lineTo(zx + 82, zy + 42);
-            ctx.moveTo(zx + 82, zy - 58);
-            ctx.lineTo(zx - 82, zy + 42);
-            ctx.stroke();
-          } else if (f.id === 'jin') {
-            // Awakened Karasu 6-Blade Cross Guillotine
-            ctx.strokeStyle = '#2dd4bf';
-            ctx.lineWidth = 5 * alpha;
-            for (let b = 0; b < 6; b++) {
-              const ang = (b / 6) * Math.PI + cProg * 1.5;
-              ctx.beginPath();
-              ctx.moveTo(zx - Math.cos(ang) * 84, zy - Math.sin(ang) * 84);
-              ctx.lineTo(zx + Math.cos(ang) * 84, zy + Math.sin(ang) * 84);
-              ctx.stroke();
-            }
+            ctx.restore();
           }
+
+          // Beat 5 (Skyward Launcher): Vertical 2.5D Launch Pillar shooting straight up from floor
+          if (beatIdx === 5 && bTick >= 9) {
+            const pAlpha = Math.max(0, 1 - (bTick - 9) / 21);
+            ctx.save();
+            ctx.globalAlpha = pAlpha * 0.75;
+            const beamW = 26 * (1 - (bTick - 9) / 28);
+            ctx.fillStyle = accent;
+            ctx.fillRect(foe.x - beamW * 0.5, foe.y - 160, beamW, 180);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(foe.x - beamW * 0.22, foe.y - 160, beamW * 0.44, 180);
+            ctx.restore();
+          }
+
+          // Character-Specific Physical Martial / Weapon Prop Visuals during Act III
+          this.drawCharacter25DComboProp(ctx, f, foe, beatIdx, bTick, camYaw);
+          continue;
+        }
+
+        // =====================================================================
+        // ACT IV (Frames 307..375): AERIAL SKY-CHASE & FOREGROUND CLIMAX POSE
+        // =====================================================================
+        if (af >= 307 && af <= 375) {
+          const aFrame = af - 307;
+          if (aFrame < 38) {
+            // Aerial Sky-Chase: High-velocity slipstream ribbons trailing the ascending fighter
+            ctx.strokeStyle = accent;
+            ctx.globalAlpha = 0.8;
+            ctx.lineWidth = 2.2;
+            for (let r = -1; r <= 1; r += 2) {
+              ctx.beginPath();
+              ctx.moveTo(f.x + r * 12, f.y);
+              ctx.lineTo(f.x + r * 26 - f.vx * 4, f.y + 68);
+              ctx.stroke();
+            }
+          } else {
+            // Foreground Climax Pose (f.z = -56): Crisp weapon/hand charge flare at foreground fighter
+            const cProg = (aFrame - 38) / 31;
+            const hx = f.x + f.facing * (f.id === 'kenji' ? -6 : 14);
+            const hy = f.y - (f.id === 'kenji' ? 6 : 22);
+            const flareR = 12 + Math.sin(cProg * Math.PI * 4) * 6 + cProg * 18;
+
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 2.6;
+            ctx.beginPath();
+            ctx.moveTo(hx - flareR * 1.6, hy);
+            ctx.lineTo(hx + flareR * 1.6, hy);
+            ctx.moveTo(hx, hy - flareR * 1.6);
+            ctx.lineTo(hx, hy + flareR * 1.6);
+            ctx.stroke();
+
+            ctx.strokeStyle = '#fde047';
+            ctx.lineWidth = 1.8;
+            ctx.beginPath();
+            ctx.arc(hx, hy, flareR * 0.65, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+          continue;
+        }
+
+        // =====================================================================
+        // ACT V (Frames 376..450): CATACLYSMIC 2.5D FINISHER IMPACT
+        // =====================================================================
+        if (af >= 376) {
+          const fFrame = af - 376;
+          this.drawCharacter25DFinisherFX(ctx, f, foe, fFrame, camYaw, camPitch);
         }
       } finally {
         ctx.restore();
@@ -595,366 +784,1051 @@ export class HDPixelRenderer {
     }
   }
 
+  private drawCharacter25DComboProp(
+    ctx: CanvasRenderingContext2D,
+    f: FighterState,
+    foe: FighterState,
+    beatIdx: number,
+    bTick: number,
+    camYaw: number
+  ): void {
+    const accent = f.spec.accentColor;
+    const secondary = f.spec.secondaryColor;
+
+    switch (f.id) {
+      case 'kuro': {
+        // Kuro: 2 physical shadow-clone silhouettes flanking the victim in 2.5D depth + kunai wires
+        const cloneX = foe.x - f.facing * (34 + Math.sin(bTick * 0.3) * 8);
+        const cloneY = foe.y - (beatIdx === 2 ? 12 : 0);
+        ctx.save();
+        ctx.globalAlpha = 0.55;
+        this.drawStickSkeleton(
+          ctx,
+          cloneX,
+          cloneY,
+          (-f.facing) as 1 | -1,
+          this.computePose(
+            'ultimate',
+            null,
+            null,
+            f.actionFrame,
+            (-f.facing) as 1 | -1,
+            0,
+            0,
+            true,
+            'dagger',
+            'ult_flank_slash'
+          ),
+          '#090d16',
+          accent,
+          accent,
+          secondary,
+          'dagger',
+          0.88,
+          0.88,
+          true,
+          0.55
+        );
+        ctx.restore();
+        break;
+      }
+      case 'velo': {
+        // Velo: Jet-heel exhaust cones & Mach shock rings around his kicking leg / gauntlet
+        const gx = f.x + f.facing * 18;
+        const gy = f.y - 14;
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2.2;
+        ctx.beginPath();
+        ctx.ellipse(gx, gy, 8, 20, f.facing * 0.45, 0, Math.PI * 2);
+        ctx.stroke();
+        break;
+      }
+      case 'kenji': {
+        // Kenji: Lingering razor-thin crimson & white katana slash lines hanging in 3D space
+        ctx.strokeStyle = '#ef4444';
+        ctx.lineWidth = 2.4;
+        const ang = (beatIdx * 0.65 - 0.4) * f.facing + camYaw * 0.25;
+        const len = 62;
+        ctx.beginPath();
+        ctx.moveTo(foe.x - Math.cos(ang) * len, foe.y - 16 - Math.sin(ang) * len);
+        ctx.lineTo(foe.x + Math.cos(ang) * len, foe.y - 16 + Math.sin(ang) * len);
+        ctx.stroke();
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+        break;
+      }
+      case 'bram': {
+        // Bram: Jagged 3D basalt rock pillars erupting from the stage floor behind the victim
+        const numRocks = 3;
+        for (let r = 0; r < numRocks; r++) {
+          const rx = foe.x + (r - 1) * 26;
+          const rh = 24 + (r % 2) * 14;
+          ctx.fillStyle = '#1e293b';
+          ctx.beginPath();
+          ctx.moveTo(rx - 9, foe.y + 2);
+          ctx.lineTo(rx - 3, foe.y + 2 - rh);
+          ctx.lineTo(rx + 8, foe.y + 2);
+          ctx.closePath();
+          ctx.fill();
+          ctx.strokeStyle = '#10b981';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+        }
+        break;
+      }
+      case 'raijin': {
+        // Raijin: 2 planted 3D Thunder Naginata lightning rods flanking the victim with live electric arcs
+        for (let side = -1; side <= 1; side += 2) {
+          const rx = foe.x + side * 52;
+          const ry = foe.y + 2;
+          ctx.strokeStyle = '#fde047';
+          ctx.lineWidth = 2.2;
+          ctx.beginPath();
+          ctx.moveTo(rx, ry);
+          ctx.lineTo(rx + side * 4, ry - 48);
+          ctx.stroke();
+          if (bTick % 3 === 0) {
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 1.6;
+            ctx.beginPath();
+            ctx.moveTo(rx + side * 4, ry - 42);
+            ctx.lineTo((rx + foe.x) * 0.5, foe.y - 26 + (bTick % 9));
+            ctx.lineTo(foe.x, foe.y - 16);
+            ctx.stroke();
+          }
+        }
+        break;
+      }
+      case 'chrono': {
+        // Chrono: Golden temporal Echo-Clone swinging a synchronized scythe from the opposite Z-plane
+        const echoX = foe.x - f.facing * 38;
+        ctx.save();
+        ctx.globalAlpha = 0.5;
+        this.drawStickSkeleton(
+          ctx,
+          echoX,
+          foe.y,
+          (-f.facing) as 1 | -1,
+          this.computePose(
+            'ultimate',
+            null,
+            null,
+            f.actionFrame,
+            (-f.facing) as 1 | -1,
+            0,
+            0,
+            true,
+            'scythe',
+            'ult_flank_slash'
+          ),
+          '#fde047',
+          '#06b6d4',
+          '#fde047',
+          '#06b6d4',
+          'scythe',
+          0.9,
+          0.9,
+          true,
+          0.5
+        );
+        ctx.restore();
+        break;
+      }
+      case 'sol': {
+        // Sol: Blazing 3D meteor-chain links whipping from Sol's hand around the opponent
+        ctx.strokeStyle = '#f97316';
+        ctx.lineWidth = 2.6;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        ctx.moveTo(f.x + f.facing * 12, f.y - 14);
+        ctx.quadraticCurveTo(
+          (f.x + foe.x) * 0.5,
+          foe.y - 38 + Math.sin(bTick * 0.5) * 14,
+          foe.x,
+          foe.y - 14
+        );
+        ctx.stroke();
+        ctx.setLineDash([]);
+        break;
+      }
+      case 'nyx': {
+        // Nyx: Sleek 2.5D vertical wormhole portal ellipses on either side of the victim (never covering them)
+        for (let side = -1; side <= 1; side += 2) {
+          const px = foe.x + side * 48;
+          const py = foe.y - 16;
+          ctx.strokeStyle = side === -1 ? '#ec4899' : '#38bdf8';
+          ctx.lineWidth = 2.2;
+          ctx.beginPath();
+          ctx.ellipse(px, py, 7, 24, side * 0.15, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        break;
+      }
+      case 'jin': {
+        // Jin: Articulated Karasu Battle-Puppet flanking the victim on the opposite side + taut strings
+        const pupX = foe.x + f.facing * 42;
+        const pupY = foe.y - 6;
+        ctx.strokeStyle = '#2dd4bf';
+        ctx.globalAlpha = 0.65;
+        ctx.lineWidth = 1.1;
+        ctx.beginPath();
+        ctx.moveTo(f.x + f.facing * 14, f.y - 18);
+        ctx.lineTo(pupX, pupY - 16);
+        ctx.stroke();
+
+        this.drawStickSkeleton(
+          ctx,
+          pupX,
+          pupY,
+          (-f.facing) as 1 | -1,
+          this.computePose(
+            'ultimate',
+            null,
+            null,
+            f.actionFrame,
+            (-f.facing) as 1 | -1,
+            0,
+            0,
+            true,
+            'claws',
+            'ult_rapid_flurry'
+          ),
+          '#1e1b4b',
+          '#f43f5e',
+          '#f43f5e',
+          '#2dd4bf',
+          'claws',
+          0.92,
+          0.92,
+          true,
+          0.82
+        );
+        break;
+      }
+    }
+  }
+
+  private drawCharacter25DFinisherFX(
+    ctx: CanvasRenderingContext2D,
+    f: FighterState,
+    foe: FighterState,
+    fFrame: number,
+    camYaw: number,
+    camPitch: number
+  ): void {
+    const accent = f.spec.accentColor;
+    const secondary = f.spec.secondaryColor;
+    const alpha = fFrame <= 20 ? 1 : Math.max(0, 1 - (fFrame - 20) / 52);
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+
+    // 1. Character-signature physical finisher slash / beam / meteor impact
+    if (f.id === 'kenji' || f.id === 'kuro' || f.id === 'chrono') {
+      // Crisp full-stage 3D dimensional katana/scythe/kunai cut-lines slicing behind and across the target
+      const cuts = [
+        { ang: -0.28 + camYaw * 0.2, col: accent, w: 5.5 },
+        { ang: 0.34 - camYaw * 0.2, col: secondary, w: 4.2 },
+        { ang: -0.04, col: '#fde047', w: 3.5 },
+      ];
+      for (const c of cuts) {
+        ctx.strokeStyle = c.col;
+        ctx.lineWidth = c.w * alpha;
+        ctx.beginPath();
+        ctx.moveTo(foe.x - Math.cos(c.ang) * 280, foe.y - 18 - Math.sin(c.ang) * 280);
+        ctx.lineTo(foe.x + Math.cos(c.ang) * 280, foe.y - 18 + Math.sin(c.ang) * 280);
+        ctx.stroke();
+
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = c.w * 0.42 * alpha;
+        ctx.stroke();
+      }
+    } else if (f.id === 'raijin' || f.id === 'sol' || f.id === 'velo') {
+      // Diagonal sky-to-ground thunder/solar/mach dive pillar erupting from the impact point
+      const ang = f.facing * 0.32;
+      ctx.save();
+      ctx.translate(foe.x, foe.y);
+      ctx.rotate(ang);
+      const colW = (38 + Math.sin(fFrame * 0.8) * 8) * alpha;
+      ctx.fillStyle = accent;
+      ctx.fillRect(-colW * 0.5, -320, colW, 340);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(-colW * 0.24, -320, colW * 0.48, 340);
+      ctx.restore();
+    } else {
+      // Bram / Nyx / Jin: Erupting 2.5D Ground Impact Crater & Upward Shock Pillars
+      for (let p = -2; p <= 2; p++) {
+        const px = foe.x + p * 28;
+        const ph = (110 - Math.abs(p) * 22) * alpha;
+        ctx.fillStyle = p % 2 === 0 ? accent : secondary;
+        ctx.fillRect(px - 6, foe.y - ph, 12, ph);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(px - 2.5, foe.y - ph, 5, ph);
+      }
+    }
+
+    // 2. 2.5D Foreshortened Multi-Ring Floor Blast Wave (Drawn cleanly on the 3D ground plane)
+    for (let r = 0; r < 2; r++) {
+      const rx = 28 + fFrame * (4.8 + r * 2.2);
+      const ry = Math.max(8, rx * (0.28 + Math.abs(camPitch) * 0.25));
+      ctx.strokeStyle = r === 0 ? '#fde047' : accent;
+      ctx.lineWidth = (4.5 - r * 1.5) * alpha;
+      ctx.beginPath();
+      ctx.ellipse(foe.x, foe.y + 2, rx, ry, camYaw * 0.2, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
   private drawUltimateCutsceneOverlay(
     ctx: CanvasRenderingContext2D,
     fighters: [FighterState, FighterState],
     tick: number
   ): void {
-    const caster = fighters.find((f) => f.action === 'ultimate' && f.actionFrame <= 82);
+    const caster = fighters.find(
+      (f) =>
+        f.action === 'ultimate' &&
+        (f.actionFrame <= 126 || (f.moveHitConnected && f.actionFrame <= 450))
+    );
     if (!caster) return;
     const af = caster.actionFrame;
 
     ctx.save();
 
-    // 1. Cinematic Widescreen Anime Letterbox Bars (Frames 1..82)
-    const barProgress = af <= 44 ? Math.min(1, af / 8) : Math.max(0.35, 1 - (af - 44) / 50);
-    const barH = Math.round(28 * barProgress);
-    ctx.fillStyle = 'rgba(4, 6, 12, 0.92)';
+    // 1. Sleek Widescreen 2.5D Cinema Letterbox Bars (Never obscuring the center of the screen!)
+    const barH = af <= 60 ? 32 : af <= 126 ? 22 : 28;
+    ctx.fillStyle = 'rgba(4, 6, 12, 0.94)';
     ctx.fillRect(0, 0, RENDER_W, barH);
     ctx.fillRect(0, RENDER_H - barH, RENDER_W, barH);
 
-    // Accent border lines on letterbox bars
+    // Glowing accent trim on letterbox bars
     ctx.fillStyle = caster.spec.accentColor;
     ctx.fillRect(0, barH - 2, RENDER_W, 2);
     ctx.fillRect(0, RENDER_H - barH, RENDER_W, 2);
 
-    // 2. Diagonal Anime Cut-In Banner during Cutscene Freeze (Frames 4..44)
-    if (af >= 4 && af <= 44) {
-      const slideIn = Math.min(1, (af - 4) / 7);
-      const fadeOut = af >= 36 ? 1 - (af - 36) / 9 : 1;
+    // 2. Act I Low-Angle Hero Cut-In Ribbon at Top-Center (Frames 3..58)
+    if (af >= 3 && af <= 58) {
+      const slideIn = Math.min(1, (af - 3) / 7);
+      const fadeOut = af >= 48 ? 1 - (af - 48) / 11 : 1;
       ctx.globalAlpha = slideIn * fadeOut;
 
-      // Diagonal speed-line ribbon across top-middle of screen
       ctx.save();
-      ctx.translate(RENDER_W * 0.5, 92);
-      ctx.rotate(-0.055 * caster.facing);
+      ctx.translate(RENDER_W * 0.5, 68);
+      ctx.rotate(-0.035 * caster.facing);
 
-      ctx.fillStyle = 'rgba(7, 10, 18, 0.92)';
-      ctx.fillRect(-420, -28, 840, 56);
+      ctx.fillStyle = 'rgba(6, 9, 18, 0.92)';
+      ctx.fillRect(-320, -24, 640, 48);
       ctx.fillStyle = caster.spec.accentColor;
-      ctx.fillRect(-420, -28, 840, 3);
+      ctx.fillRect(-320, -24, 640, 2.5);
       ctx.fillStyle = '#fde047';
-      ctx.fillRect(-420, 25, 840, 3);
+      ctx.fillRect(-320, 21.5, 640, 2.5);
 
-      // Speed streaks inside banner
-      ctx.strokeStyle = caster.spec.secondaryColor;
-      ctx.lineWidth = 1.5;
-      for (let i = 0; i < 10; i++) {
-        const sx = ((i * 97 + tick * 28) % 800) - 400;
-        const sy = -22 + (i % 5) * 11;
-        ctx.beginPath();
-        ctx.moveTo(sx, sy);
-        ctx.lineTo(sx + 65, sy);
-        ctx.stroke();
-      }
-
-      // Caster Name + Ultimate Art Title
       ctx.textAlign = 'center';
-      ctx.font = '800 11px "JetBrains Mono", monospace';
+      ctx.font = '800 10px "JetBrains Mono", monospace';
       ctx.fillStyle = caster.spec.secondaryColor;
       ctx.fillText(
-        `${caster.spec.name} // UNBLOCKABLE ULTIMATE AWAKENING`,
+        `${caster.spec.name} // "${caster.spec.tauntQuote}"`,
         0,
-        -9
+        -7
       );
 
-      ctx.font = '900 24px "Chakra Petch", sans-serif';
+      ctx.font = '900 20px "Chakra Petch", sans-serif';
       ctx.fillStyle = '#ffffff';
-      ctx.fillText(caster.spec.ultimateName, 0, 17);
+      ctx.fillText(caster.spec.ultimateName, 0, 14);
       ctx.restore();
     }
 
-    // 3. Evasion Phase HUD Warning Banner (Frames 45..82)
-    if (af >= 45 && af <= 82) {
-      const pulse = tick % 8 < 4;
+    // 3. Act II Unblockable Pursuit Alert on Top Bar (Frames 61..126)
+    if (af >= 61 && af <= 126 && !caster.moveHitConnected) {
+      const pulse = tick % 6 < 3;
       ctx.textAlign = 'center';
-      ctx.font = '800 12px "JetBrains Mono", monospace';
+      ctx.font = '800 11px "JetBrains Mono", monospace';
       ctx.fillStyle = pulse ? '#ef4444' : '#fde047';
       ctx.fillText(
-        `⚠ ${caster.spec.ultimateName} — UNBLOCKABLE! RUN OR DODGE OUT OF THE DANGER ZONE! ⚠`,
+        `⚠ ${caster.spec.ultimateName} — UNBLOCKABLE RUSH! EVADE NOW! ⚠`,
         RENDER_W * 0.5,
-        barH + 18
+        barH - 6
+      );
+    }
+
+    // 4. Live Choreographed Stage Readout cleanly inside Bottom Letterbox Bar
+    if (caster.ultStageLabel) {
+      ctx.textAlign = 'center';
+      ctx.font = '900 13px "Chakra Petch", sans-serif';
+      ctx.fillStyle = af >= 376 ? '#fde047' : '#f8fafc';
+      ctx.fillText(
+        `${caster.spec.ultimateName}  //  ${caster.ultStageLabel}`,
+        RENDER_W * 0.5,
+        RENDER_H - 8
       );
     }
 
     ctx.restore();
   }
 
+  // ===========================================================================
+  // HD-PIXEL ART STAGE & PLATFORM PRIMITIVES
+  // ===========================================================================
+
+  private drawPixelDitherBand(
+    ctx: CanvasRenderingContext2D,
+    y: number,
+    h: number,
+    colorTop: string,
+    colorBot: string,
+    px = 2
+  ): void {
+    ctx.fillStyle = colorTop;
+    ctx.fillRect(0, y, RENDER_W, h);
+    ctx.fillStyle = colorBot;
+    const rows = Math.floor(h / px);
+    for (let r = 0; r < rows; r++) {
+      const ratio = r / Math.max(1, rows - 1);
+      for (let c = 0; c < Math.ceil(RENDER_W / px); c++) {
+        const bayer = ((r & 1) << 1) | ((c & 1) ^ (r & 1)); // 0..3 Bayer 2x2
+        if (ratio * 4 > bayer + 0.3) {
+          ctx.fillRect(c * px, y + r * px, px, px);
+        }
+      }
+    }
+  }
+
+  private drawPixelDisc(
+    ctx: CanvasRenderingContext2D,
+    cx: number,
+    cy: number,
+    radius: number,
+    baseColor: string,
+    lightColor: string,
+    craterColor: string,
+    px = 2
+  ): void {
+    const rSteps = Math.ceil(radius / px);
+    for (let dy = -rSteps; dy <= rSteps; dy++) {
+      const y = cy + dy * px;
+      const dxMax = Math.floor(Math.sqrt(Math.max(0, rSteps * rSteps - dy * dy)));
+      if (dxMax <= 0) continue;
+      const leftX = cx - dxMax * px;
+      const spanW = dxMax * 2 * px;
+      ctx.fillStyle = baseColor;
+      ctx.fillRect(leftX, y, spanW, px);
+      // Pixel rim highlight on upper-left crescent
+      if (dy < rSteps * 0.55) {
+        ctx.fillStyle = lightColor;
+        ctx.fillRect(leftX, y, Math.max(px, Math.floor(spanW * 0.24)), px);
+      }
+    }
+    // Pixel craters / surface texture
+    ctx.fillStyle = craterColor;
+    ctx.fillRect(cx + Math.round(radius * 0.18), cy - Math.round(radius * 0.22), px * 5, px * 3);
+    ctx.fillRect(cx + Math.round(radius * 0.24), cy - Math.round(radius * 0.32), px * 3, px * 5);
+    ctx.fillRect(cx - Math.round(radius * 0.12), cy + Math.round(radius * 0.24), px * 4, px * 2);
+    ctx.fillRect(cx + Math.round(radius * 0.34), cy + Math.round(radius * 0.12), px * 3, px * 3);
+  }
+
+  private drawPixelSakuraTree(
+    ctx: CanvasRenderingContext2D,
+    baseX: number,
+    baseY: number,
+    flip: 1 | -1,
+    tick: number
+  ): void {
+    const sway = Math.round(Math.sin(tick * 0.03 + baseX * 0.05) * 2);
+    // 1. Gnarled Pixel-Art Bark Trunk & Roots
+    ctx.fillStyle = '#1c1018';
+    ctx.fillRect(baseX - 9, baseY - 22, 18, 22);
+    ctx.fillRect(baseX - 13, baseY - 6, 26, 6);
+    ctx.fillRect(baseX - 7 + flip * 3, baseY - 44, 14, 24);
+    ctx.fillRect(baseX - 5 + flip * 8, baseY - 64, 11, 22);
+    // Bark highlights
+    ctx.fillStyle = '#3b212f';
+    ctx.fillRect(baseX - 5, baseY - 20, 4, 18);
+    ctx.fillRect(baseX - 3 + flip * 3, baseY - 42, 4, 20);
+    // Reaching boughs
+    ctx.fillStyle = '#1c1018';
+    ctx.fillRect(baseX + flip * 10, baseY - 56, 28 * flip, 6);
+    ctx.fillRect(baseX - flip * 18, baseY - 48, 22, 5);
+
+    // 2. Multi-Tone Pixel Blossom Canopy Clusters
+    const clusters = [
+      { ox: -22 * flip, oy: -54, w: 34, h: 18 },
+      { ox: 14 * flip, oy: -64, w: 42, h: 20 },
+      { ox: -4 * flip, oy: -78, w: 46, h: 22 },
+      { ox: 28 * flip, oy: -50, w: 32, h: 16 },
+    ];
+    for (const cl of clusters) {
+      const cx = Math.round(baseX + cl.ox + sway);
+      const cy = Math.round(baseY + cl.oy);
+      const hw = Math.round(cl.w * 0.5);
+      // Deep shadow layer
+      ctx.fillStyle = '#881337';
+      ctx.fillRect(cx - hw, cy + 4, cl.w, cl.h - 2);
+      ctx.fillRect(cx - hw + 4, cy, cl.w - 8, cl.h + 4);
+      // Mid blossom pink
+      ctx.fillStyle = '#e11d48';
+      ctx.fillRect(cx - hw + 2, cy, cl.w - 4, cl.h - 4);
+      // Bright sakura pink
+      ctx.fillStyle = '#fb7185';
+      ctx.fillRect(cx - hw + 4, cy - 2, cl.w - 8, Math.round(cl.h * 0.55));
+      // Top white-pink pixel clusters
+      ctx.fillStyle = '#ffe4e6';
+      for (let px = cx - hw + 6; px < cx + hw - 8; px += 8) {
+        ctx.fillRect(px, cy - 2 + ((px * 3) % 4), 4, 3);
+      }
+    }
+  }
+
+  private drawPixelGear(
+    ctx: CanvasRenderingContext2D,
+    cx: number,
+    cy: number,
+    radius: number,
+    teeth: number,
+    angle: number,
+    darkCol: string,
+    midCol: string,
+    lightCol: string
+  ): void {
+    ctx.save();
+    ctx.translate(Math.round(cx), Math.round(cy));
+    ctx.rotate(angle);
+    // Pixel teeth
+    ctx.fillStyle = midCol;
+    for (let i = 0; i < teeth; i++) {
+      ctx.save();
+      ctx.rotate((i / teeth) * Math.PI * 2);
+      ctx.fillRect(-4, -radius - 6, 8, 8);
+      ctx.fillStyle = lightCol;
+      ctx.fillRect(-3, -radius - 6, 6, 2);
+      ctx.fillStyle = midCol;
+      ctx.restore();
+    }
+    // Outer ring
+    ctx.strokeStyle = midCol;
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.arc(0, 0, radius - 2, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.strokeStyle = lightCol;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(0, 0, radius + 1, 0, Math.PI * 2);
+    ctx.stroke();
+    // Spokes
+    ctx.fillStyle = darkCol;
+    for (let s = 0; s < 4; s++) {
+      ctx.save();
+      ctx.rotate((s / 4) * Math.PI);
+      ctx.fillRect(-3, -radius + 4, 6, (radius - 4) * 2);
+      ctx.restore();
+    }
+    // Hub
+    ctx.fillStyle = lightCol;
+    ctx.fillRect(-7, -7, 14, 14);
+    ctx.fillStyle = '#05070d';
+    ctx.fillRect(-3, -3, 6, 6);
+    ctx.restore();
+  }
+
   private drawParallaxStage(ctx: CanvasRenderingContext2D, scene: RenderSceneData): void {
     const { stage, camX, camY, tick } = scene;
-    const grad = ctx.createLinearGradient(0, 0, 0, RENDER_H);
-    grad.addColorStop(0, stage.skyTop);
-    grad.addColorStop(0.55, stage.skyMid);
-    grad.addColorStop(1, stage.skyBottom);
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, RENDER_W, RENDER_H);
 
-    // Distant stars / atmospheric motes
-    ctx.fillStyle = 'rgba(248, 250, 252, 0.35)';
-    for (let i = 0; i < 42; i++) {
-      const sx = (((i * 137 + 50 - camX * 0.04) % RENDER_W) + RENDER_W) % RENDER_W;
-      const sy = (i * 73 + 20) % (RENDER_H * 0.62);
-      const sz = i % 5 === 0 ? 2 : 1;
-      ctx.fillRect(Math.floor(sx), Math.floor(sy), sz, sz);
+    // 1. Stepped Pixel-Art Sky Bands + Bayer Dithering Transitions
+    ctx.fillStyle = stage.skyTop;
+    ctx.fillRect(0, 0, RENDER_W, 130);
+    this.drawPixelDitherBand(ctx, 110, 44, stage.skyTop, stage.skyMid, 2);
+    ctx.fillStyle = stage.skyMid;
+    ctx.fillRect(0, 154, RENDER_W, 130);
+    this.drawPixelDitherBand(ctx, 260, 48, stage.skyMid, stage.skyBottom, 2);
+    ctx.fillStyle = stage.skyBottom;
+    ctx.fillRect(0, 308, RENDER_W, RENDER_H - 308);
+
+    // 2. Twinkling Pixel Starfield & Constellations
+    for (let i = 0; i < 56; i++) {
+      const sx = Math.floor((((i * 137 + 50 - camX * 0.04) % RENDER_W) + RENDER_W) % RENDER_W);
+      const sy = Math.floor((i * 73 + 14) % (RENDER_H * 0.58));
+      const twinkle = (tick + i * 13) % 40 < 6;
+      if (i % 7 === 0) {
+        // 5-pixel cross star
+        ctx.fillStyle = twinkle ? '#ffffff' : stage.accentColor;
+        ctx.fillRect(sx, sy, 2, 2);
+        ctx.fillStyle = 'rgba(248, 250, 252, 0.55)';
+        ctx.fillRect(sx - 2, sy, 6, 1);
+        ctx.fillRect(sx, sy - 2, 1, 6);
+      } else {
+        ctx.fillStyle = twinkle ? '#ffffff' : 'rgba(226, 232, 240, 0.45)';
+        const sz = i % 4 === 0 ? 2 : 1;
+        ctx.fillRect(sx, sy, sz, sz);
+      }
     }
 
     if (stage.id === 'void_flat') {
-      // HORIZON ZERO: Total Solar Eclipse + Infinite Mirror Water Horizon
+      // =======================================================================
+      // 1. HORIZON ZERO: Sunken Astral Sanctuary, Shattered Eclipse & Mirror Sea
+      // =======================================================================
       const ex = Math.round(RENDER_W * 0.5 - camX * 0.06);
-      const ey = Math.round(138 - camY * 0.05);
-      const pulse = Math.sin(tick * 0.03) * 4;
+      const ey = Math.round(126 - camY * 0.05);
 
-      // Outer corona glow
-      ctx.fillStyle = 'rgba(56, 189, 248, 0.12)';
-      ctx.beginPath();
-      ctx.arc(ex, ey, 94 + pulse, 0, Math.PI * 2);
-      ctx.fill();
+      // Pixel-stepped Eclipse Corona Rings
+      this.drawPixelDisc(ctx, ex, ey, 78, '#0c2342', '#1e426e', '#08172e', 3);
+      this.drawPixelDisc(ctx, ex, ey, 60, '#38bdf8', '#e0f2fe', '#0284c7', 2);
+      this.drawPixelDisc(ctx, ex, ey, 50, '#030611', '#0f172a', '#050b1c', 2);
 
-      // Rotating solar rays
-      ctx.save();
-      ctx.translate(ex, ey);
-      ctx.rotate(tick * 0.004);
-      ctx.strokeStyle = 'rgba(186, 230, 253, 0.22)';
-      ctx.lineWidth = 2;
-      for (let i = 0; i < 12; i++) {
-        const a = (i / 12) * Math.PI * 2;
-        ctx.beginPath();
-        ctx.moveTo(Math.cos(a) * 58, Math.sin(a) * 58);
-        ctx.lineTo(Math.cos(a) * (88 + (i % 2) * 18), Math.sin(a) * (88 + (i % 2) * 18));
-        ctx.stroke();
+      // Floating shattered pixel-art astral ring fragments around eclipse
+      for (let f = 0; f < 14; f++) {
+        const ang = (f / 14) * Math.PI * 2 + tick * 0.004;
+        const fx = Math.round(ex + Math.cos(ang) * 92);
+        const fy = Math.round(ey + Math.sin(ang) * 32);
+        ctx.fillStyle = f % 2 === 0 ? '#e0f2fe' : '#38bdf8';
+        ctx.fillRect(fx - 3, fy - 2, 6, 4);
+        ctx.fillStyle = '#0369a1';
+        ctx.fillRect(fx - 2, fy + 2, 4, 2);
       }
-      ctx.restore();
 
-      // Bright diamond ring + black eclipse core
-      ctx.strokeStyle = '#e0f2fe';
-      ctx.lineWidth = 3;
-      ctx.beginPath();
-      ctx.arc(ex, ey, 54, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.fillStyle = '#030611';
-      ctx.beginPath();
-      ctx.arc(ex, ey, 52, 0, Math.PI * 2);
-      ctx.fill();
+      // Distant Sunken Astral Temple Columns & Broken Architraves in Parallax
+      const ruinPositions = [-320, -210, -115, 115, 210, 320];
+      for (let i = 0; i < ruinPositions.length; i++) {
+        const rx = Math.round(RENDER_W * 0.5 + ruinPositions[i] - camX * 0.16);
+        const rh = 75 + (i % 3) * 28;
+        const ry = 292 - rh;
+        // Fluted pixel column
+        ctx.fillStyle = '#0f203c';
+        ctx.fillRect(rx - 10, ry, 20, rh);
+        ctx.fillStyle = '#1e3a5f';
+        ctx.fillRect(rx - 8, ry, 4, rh);
+        ctx.fillRect(rx, ry, 4, rh);
+        ctx.fillStyle = '#38bdf8';
+        ctx.fillRect(rx - 10, ry, 2, rh);
+        // Stepped Corinthian capital / jagged ruin top
+        ctx.fillStyle = '#1e3a5f';
+        ctx.fillRect(rx - 14, ry - 6, 28, 6);
+        ctx.fillStyle = '#7dd3fc';
+        ctx.fillRect(rx - 14, ry - 6, 28, 2);
+      }
 
-      // Mirror water reflection lines on the lower horizon
-      const horizonY = 305;
-      ctx.fillStyle = 'rgba(7, 15, 34, 0.85)';
+      // Infinite Pixel-Art Mirror Ocean & Shimmering Reflection Scanlines
+      const horizonY = 290;
+      this.drawPixelDitherBand(ctx, horizonY - 12, 14, '#162947', '#061024', 2);
+      ctx.fillStyle = '#061024';
       ctx.fillRect(0, horizonY, RENDER_W, RENDER_H - horizonY);
-      ctx.strokeStyle = 'rgba(56, 189, 248, 0.32)';
-      ctx.lineWidth = 1;
-      for (let r = 0; r < 14; r++) {
-        const ry = horizonY + r * 10;
-        const rw = Math.max(12, 130 - r * 7 + Math.sin(tick * 0.08 + r) * 12);
-        ctx.beginPath();
-        ctx.moveTo(ex - rw, ry);
-        ctx.lineTo(ex + rw, ry);
-        ctx.stroke();
+      for (let r = 0; r < 24; r++) {
+        const ry = horizonY + r * 6;
+        const waveShift = Math.round(Math.sin(tick * 0.06 + r * 0.7) * 8);
+        const rw = Math.max(14, 140 - r * 4);
+        ctx.fillStyle = r % 3 === 0 ? '#7dd3fc' : '#0284c7';
+        ctx.fillRect(ex - rw + waveShift, ry, rw * 2, 2);
+        if (r % 2 === 0) {
+          ctx.fillStyle = '#e0f2fe';
+          ctx.fillRect(ex - Math.round(rw * 0.4) - waveShift, ry, Math.round(rw * 0.8), 2);
+        }
       }
     } else if (stage.id === 'torii') {
-      // CRIMSON TORII SHRINE: Blood Moon, Layered Mountains, Torii & Sakura Petals
-      const mx = Math.round(RENDER_W * 0.5 - camX * 0.07);
-      const my = Math.round(135 - camY * 0.05);
-      ctx.fillStyle = 'rgba(244, 63, 94, 0.14)';
-      ctx.beginPath();
-      ctx.arc(mx, my, 96, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#e11d48';
-      ctx.beginPath();
-      ctx.arc(mx, my, 64, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#fb7185';
-      ctx.beginPath();
-      ctx.arc(mx - 10, my - 10, 48, 0, Math.PI * 2);
-      ctx.fill();
+      // =======================================================================
+      // 2. CRIMSON TORII: Blood Moon, Pixel Mt. Fuji, Torii Shrine & Sakura Trees
+      // =======================================================================
+      const mx = Math.round(RENDER_W * 0.5 - camX * 0.06);
+      const my = Math.round(122 - camY * 0.05);
+      this.drawPixelDisc(ctx, mx, my, 66, '#be123c', '#fda4af', '#881337', 2);
 
-      this.drawMountainLayer(ctx, camX * 0.12, '#140f24', 290, 55, 0.008);
-      this.drawMountainLayer(ctx, camX * 0.22, '#1d142f', 330, 38, 0.014);
-
-      const gx = Math.round(RENDER_W * 0.5 - camX * 0.35);
-      const gy = Math.round(305 - camY * 0.2);
-      ctx.fillStyle = '#180c1e';
-      ctx.fillRect(gx - 58, gy - 95, 12, 130);
-      ctx.fillRect(gx + 46, gy - 95, 12, 130);
-      ctx.fillStyle = '#be123c';
-      ctx.fillRect(gx - 78, gy - 102, 156, 10);
-      ctx.fillStyle = '#0c0816';
-      ctx.fillRect(gx - 86, gy - 112, 172, 9);
-      ctx.fillRect(gx - 66, gy - 78, 132, 7);
-
-      // Drifting sakura petals
-      ctx.fillStyle = '#fda4af';
-      for (let i = 0; i < 22; i++) {
-        const px = (((i * 83 - tick * 0.85 - camX * 0.25) % RENDER_W) + RENDER_W) % RENDER_W;
-        const py = (i * 47 + tick * 0.55 + Math.sin(tick * 0.04 + i) * 8) % RENDER_H;
-        ctx.fillRect(Math.floor(px), Math.floor(py), 3, 2);
+      // Far Pixel-Art Mount Fuji Silhouette with Snow-Cap
+      const fujiX = Math.round(RENDER_W * 0.5 - 110 - camX * 0.09);
+      const fujiBaseY = 295;
+      for (let row = 0; row < 110; row += 2) {
+        const ratio = row / 110;
+        const halfW = Math.round(18 + Math.pow(ratio, 1.35) * 195);
+        ctx.fillStyle = row < 34 ? '#fecdd3' : row < 44 && (row + fujiX) % 4 === 0 ? '#fda4af' : '#180c24';
+        ctx.fillRect(fujiX - halfW, fujiBaseY - 110 + row, halfW * 2, 2);
       }
 
-      for (let i = -2; i <= 2; i++) {
-        if (i === 0) continue;
-        const lx = Math.round(RENDER_W * 0.5 + i * 135 - camX * 0.28);
-        const ly = Math.round(250 + Math.sin(tick * 0.03 + i) * 6 - camY * 0.15);
-        ctx.fillStyle = 'rgba(251, 146, 60, 0.22)';
-        ctx.fillRect(lx - 8, ly - 8, 16, 20);
-        ctx.fillStyle = '#fb923c';
-        ctx.fillRect(lx - 3, ly - 4, 6, 9);
-        ctx.fillStyle = '#fef3c7';
-        ctx.fillRect(lx - 2, ly - 2, 4, 5);
+      // Layered Pixel-Art Pine Mountain Ridges
+      this.drawMountainLayer(ctx, camX * 0.14, '#140b21', 292, 48, 0.008);
+      this.drawMountainLayer(ctx, camX * 0.24, '#21102e', 326, 34, 0.015);
+
+      // Grand Pixel-Art Vermilion Torii Gate in Midground
+      const gx = Math.round(RENDER_W * 0.5 - camX * 0.32);
+      const gy = Math.round(302 - camY * 0.18);
+      // Stone pedestals (Kamebara)
+      ctx.fillStyle = '#1e293b';
+      ctx.fillRect(gx - 70, gy + 10, 22, 24);
+      ctx.fillRect(gx + 48, gy + 10, 22, 24);
+      // Vermilion pillars (Hashira) with pixel shading
+      ctx.fillStyle = '#9f1239';
+      ctx.fillRect(gx - 65, gy - 98, 14, 112);
+      ctx.fillRect(gx + 51, gy - 98, 14, 112);
+      ctx.fillStyle = '#f43f5e';
+      ctx.fillRect(gx - 63, gy - 98, 4, 112);
+      ctx.fillRect(gx + 53, gy - 98, 4, 112);
+      // Lower tie-beam (Nuki)
+      ctx.fillStyle = '#881337';
+      ctx.fillRect(gx - 78, gy - 76, 156, 9);
+      ctx.fillStyle = '#fbbf24';
+      ctx.fillRect(gx - 66, gy - 76, 16, 9);
+      ctx.fillRect(gx + 50, gy - 76, 16, 9);
+      ctx.fillRect(gx - 8, gy - 96, 16, 22); // Gaku-zuka tablet
+      // Curved top lintel (Kasagi) with upturned pixel eaves
+      ctx.fillStyle = '#be123c';
+      ctx.fillRect(gx - 88, gy - 104, 176, 8);
+      ctx.fillStyle = '#090612';
+      ctx.fillRect(gx - 94, gy - 111, 188, 7);
+      ctx.fillRect(gx - 100, gy - 115, 16, 5);
+      ctx.fillRect(gx + 84, gy - 115, 16, 5);
+      // Sacred Shimenawa rope & white zig-zag Shide paper talismans
+      ctx.fillStyle = '#d97706';
+      ctx.fillRect(gx - 50, gy - 66, 100, 4);
+      ctx.fillStyle = '#f8fafc';
+      for (let sh = -36; sh <= 36; sh += 24) {
+        ctx.fillRect(gx + sh - 2, gy - 62, 4, 6);
+        ctx.fillRect(gx + sh, gy - 57, 4, 6);
+        ctx.fillRect(gx + sh - 2, gy - 52, 4, 5);
+      }
+
+      // Twin Gnarled Pixel-Art Sakura Trees framing the shrine
+      this.drawPixelSakuraTree(ctx, gx - 165, gy + 14, -1, tick);
+      this.drawPixelSakuraTree(ctx, gx + 165, gy + 14, 1, tick);
+
+      // Carved Stone Toro Lanterns with flickering pixel fire
+      for (const side of [-1, 1]) {
+        const lx = gx + side * 112;
+        const ly = gy + 4;
+        ctx.fillStyle = '#334155';
+        ctx.fillRect(lx - 6, ly - 24, 12, 28);
+        ctx.fillStyle = '#475569';
+        ctx.fillRect(lx - 10, ly - 28, 20, 5);
+        ctx.fillRect(lx - 8, ly - 12, 16, 4);
+        ctx.fillStyle = (tick + side * 7) % 8 < 4 ? '#fde047' : '#fb923c';
+        ctx.fillRect(lx - 3, ly - 22, 6, 8);
+      }
+
+      // Drifting 2-tone pixel sakura petals
+      for (let i = 0; i < 36; i++) {
+        const px = Math.floor((((i * 79 - tick * 0.9 - camX * 0.25) % RENDER_W) + RENDER_W) % RENDER_W);
+        const py = Math.floor((i * 43 + tick * 0.6 + Math.sin(tick * 0.04 + i) * 9) % RENDER_H);
+        ctx.fillStyle = i % 2 === 0 ? '#ffe4e6' : '#fb7185';
+        ctx.fillRect(px, py, 3, 2);
+        ctx.fillRect(px + 1, py + 2, 2, 1);
       }
     } else if (stage.id === 'dojo') {
-      // CLOUD PAGODA DOJO: Grand Multi-Tier Pagoda Silhouette, Scrolling Clouds & Banners
-      const px = Math.round(RENDER_W * 0.5 - camX * 0.14);
-      const py = Math.round(285 - camY * 0.1);
-      ctx.fillStyle = '#0b1829';
-      for (let tier = 0; tier < 4; tier++) {
-        const tw = 150 - tier * 26;
+      // =======================================================================
+      // 3. CLOUD PAGODA: 5-Story Pixel Pagoda, Floating Waterfalls & Pulley Chains
+      // =======================================================================
+      // Distant Wuxia Floating Sky-Peaks & Cascading Pixel Waterfalls
+      for (const side of [-1, 1]) {
+        const pkX = Math.round(RENDER_W * 0.5 + side * 245 - camX * 0.1);
+        const pkY = Math.round(170 - camY * 0.06);
+        ctx.fillStyle = '#0d1f36';
+        ctx.fillRect(pkX - 34, pkY - 50, 68, 95);
+        ctx.fillRect(pkX - 22, pkY - 78, 44, 30);
+        ctx.fillRect(pkX - 18, pkY + 45, 36, 26);
+        ctx.fillStyle = '#1e3a5f';
+        ctx.fillRect(pkX - 34, pkY - 50, 12, 90);
+        // Animated pixel waterfall pouring from floating island
+        const wfX = pkX + side * 8;
+        ctx.fillStyle = '#38bdf8';
+        ctx.fillRect(wfX - 4, pkY + 10, 8, 160);
+        ctx.fillStyle = '#e0f2fe';
+        for (let wy = 0; wy < 150; wy += 12) {
+          const dropY = pkY + 10 + ((wy + tick * 3) % 150);
+          ctx.fillRect(wfX - 2, dropY, 4, 6);
+        }
+      }
+
+      // Grand 5-Story Pixel-Art Cloud Pagoda
+      const px = Math.round(RENDER_W * 0.5 - camX * 0.16);
+      const py = Math.round(300 - camY * 0.12);
+      for (let tier = 0; tier < 5; tier++) {
+        const tw = 164 - tier * 24;
         const ty = py - tier * 38;
-        ctx.fillRect(px - tw * 0.5, ty - 28, tw, 26);
-        ctx.beginPath();
-        ctx.moveTo(px - tw * 0.65, ty - 26);
-        ctx.lineTo(px + tw * 0.65, ty - 26);
-        ctx.lineTo(px + tw * 0.48, ty - 38);
-        ctx.lineTo(px - tw * 0.48, ty - 38);
-        ctx.closePath();
-        ctx.fill();
-      }
-      // Spire
-      ctx.fillRect(px - 3, py - 190, 6, 40);
-
-      // Drifting golden-rimmed cloud banks
-      for (let c = 0; c < 6; c++) {
-        const cx = (((c * 175 + tick * 0.35 - camX * 0.2) % (RENDER_W + 160)) - 80);
-        const cy = 265 + (c % 2) * 32;
-        ctx.fillStyle = 'rgba(30, 58, 95, 0.55)';
-        ctx.beginPath();
-        ctx.arc(cx, cy, 42, 0, Math.PI * 2);
-        ctx.arc(cx + 34, cy + 6, 32, 0, Math.PI * 2);
-        ctx.arc(cx - 32, cy + 8, 30, 0, Math.PI * 2);
-        ctx.fill();
-      }
-
-      for (let i = -1; i <= 1; i += 2) {
-        const lx = Math.round(RENDER_W * 0.5 + i * 190 - camX * 0.22);
-        ctx.fillStyle = 'rgba(245, 158, 11, 0.16)';
-        ctx.beginPath();
-        ctx.arc(lx, 125, 46, 0, Math.PI * 2);
-        ctx.fill();
+        // Timber walls & glowing shoji lattice windows
+        ctx.fillStyle = '#170f11';
+        ctx.fillRect(px - Math.round(tw * 0.44), ty - 28, Math.round(tw * 0.88), 28);
+        ctx.fillStyle = '#7c2d12';
+        ctx.fillRect(px - Math.round(tw * 0.42), ty - 26, 4, 24);
+        ctx.fillRect(px + Math.round(tw * 0.42) - 4, ty - 26, 4, 24);
+        // Illuminated paper shoji panels
+        ctx.fillStyle = '#fbbf24';
+        for (let wx = -Math.round(tw * 0.26); wx <= Math.round(tw * 0.22); wx += 18) {
+          ctx.fillRect(px + wx, ty - 20, 8, 14);
+        }
+        // Scalloped pixel roof tiles & upturned golden eaves
+        const roofW = Math.round(tw * 1.24);
+        ctx.fillStyle = '#091526';
+        ctx.fillRect(px - Math.round(roofW * 0.5), ty - 35, roofW, 8);
+        ctx.fillStyle = '#1e3a5f';
+        for (let rx = -Math.round(roofW * 0.48); rx < Math.round(roofW * 0.48); rx += 8) {
+          ctx.fillRect(px + rx, ty - 35, 5, 6);
+        }
+        // Upturned dragon eave tips & golden wind-chimes
         ctx.fillStyle = '#f59e0b';
-        ctx.fillRect(lx - 7, 108, 14, 22);
-        ctx.fillStyle = '#fef08a';
-        ctx.fillRect(lx - 4, 112, 8, 14);
+        ctx.fillRect(px - Math.round(roofW * 0.5) - 6, ty - 39, 10, 5);
+        ctx.fillRect(px + Math.round(roofW * 0.5) - 4, ty - 39, 10, 5);
+        ctx.fillRect(px - Math.round(roofW * 0.5) - 2, ty - 27, 2, 7);
+        ctx.fillRect(px + Math.round(roofW * 0.5), ty - 27, 2, 7);
+      }
+      // Golden Sorin Spire at peak
+      ctx.fillStyle = '#f59e0b';
+      ctx.fillRect(px - 3, py - 228, 6, 38);
+      for (let r = 0; r < 5; r++) {
+        ctx.fillRect(px - 8 + r, py - 198 - r * 6, 16 - r * 2, 2);
+      }
+
+      // Pixel-Art Sunset Cloud Banks
+      for (let c = 0; c < 7; c++) {
+        const cx = Math.round(((c * 155 + tick * 0.4 - camX * 0.22) % (RENDER_W + 180)) - 90);
+        const cy = 278 + (c % 2) * 26;
+        ctx.fillStyle = '#162d4c';
+        ctx.fillRect(cx - 48, cy, 96, 22);
+        ctx.fillRect(cx - 34, cy - 10, 68, 12);
+        ctx.fillStyle = '#f59e0b';
+        ctx.fillRect(cx - 32, cy - 12, 64, 3);
       }
     } else if (stage.id === 'monolith') {
-      // TWIN ABYSS RIFT: Swirling Chasm Vortex, Ley-Line Beams & Floating Rune Obelisks
-      const rx = Math.round(RENDER_W * 0.5 - camX * 0.1);
-      const ry = Math.round(285 - camY * 0.08);
+      // =======================================================================
+      // 4. TWIN ABYSS RIFT: Subterranean Crystal Chasm, Monolith Statues & Falls
+      // =======================================================================
+      const rx = Math.round(RENDER_W * 0.5 - camX * 0.12);
 
-      // Vertical emerald energy beam shooting from the central chasm
-      const beamGrad = ctx.createLinearGradient(rx - 45, 0, rx + 45, 0);
-      beamGrad.addColorStop(0, 'rgba(16, 185, 129, 0)');
-      beamGrad.addColorStop(0.5, 'rgba(16, 185, 129, 0.22)');
-      beamGrad.addColorStop(1, 'rgba(16, 185, 129, 0)');
-      ctx.fillStyle = beamGrad;
-      ctx.fillRect(rx - 45, 0, 90, RENDER_H);
-
-      for (let r = 95; r >= 25; r -= 18) {
-        ctx.strokeStyle = r === 43 ? '#34d399' : 'rgba(16, 185, 129, 0.32)';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.ellipse(rx, ry, r * 1.5, r * 0.5, Math.sin(tick * 0.015) * 0.12, 0, Math.PI * 2);
-        ctx.stroke();
+      // Cavern ceiling pixel stalactites
+      ctx.fillStyle = '#051017';
+      for (let s = 0; s < 26; s++) {
+        const sx = Math.round(((s * 41 - camX * 0.08) % RENDER_W + RENDER_W) % RENDER_W);
+        const sh = 18 + ((s * 29) % 44);
+        ctx.fillRect(sx - 6, 0, 12, Math.round(sh * 0.5));
+        ctx.fillRect(sx - 3, 0, 6, sh);
+        if (s % 4 === 0) {
+          ctx.fillStyle = '#10b981';
+          ctx.fillRect(sx - 1, sh - 4, 2, 6);
+          ctx.fillStyle = '#051017';
+        }
       }
+
+      // Central Emerald Abyss Energy Pillar
+      for (let b = -36; b <= 36; b += 4) {
+        const alpha = (1 - Math.abs(b) / 40) * 0.28;
+        ctx.fillStyle = `rgba(16, 185, 129, ${alpha})`;
+        ctx.fillRect(rx + b, 0, 4, RENDER_H);
+      }
+
+      // Twin Weeping Ancient Monolith Guardian Statues with Aether Waterfalls
+      for (const side of [-1, 1]) {
+        const mx = Math.round(RENDER_W * 0.5 + side * 145 - camX * 0.2);
+        const my = Math.round(185 - camY * 0.1);
+        // Chiseled stone head & torso
+        ctx.fillStyle = '#0c1f24';
+        ctx.fillRect(mx - 24, my - 46, 48, 140);
+        ctx.fillStyle = '#16353d';
+        ctx.fillRect(mx - 20, my - 42, 14, 130);
+        // Glowing emerald visor eyes & weeping aether waterfalls
+        ctx.fillStyle = '#34d399';
+        ctx.fillRect(mx - 14, my - 22, 10, 4);
+        ctx.fillRect(mx + 4, my - 22, 10, 4);
+        ctx.fillStyle = '#10b981';
+        ctx.fillRect(mx - 11, my - 18, 4, 210);
+        ctx.fillRect(mx + 7, my - 18, 4, 210);
+        ctx.fillStyle = '#a7f3d0';
+        for (let wy = 0; wy < 190; wy += 16) {
+          const dy = my - 16 + ((wy + tick * 3.5) % 190);
+          ctx.fillRect(mx - 10, dy, 2, 6);
+          ctx.fillRect(mx + 8, dy + 6, 2, 6);
+        }
+      }
+
+      // Background Giant Pixel Emerald Crystal Clusters
       for (let i = -3; i <= 3; i++) {
         if (i === 0) continue;
-        const sx = Math.round(RENDER_W * 0.5 + i * 115 - camX * 0.22);
-        const sy = Math.round(200 + Math.sin(tick * 0.03 + i * 1.3) * 12);
-        ctx.fillStyle = '#0f292e';
-        ctx.fillRect(sx - 10, sy - 28, 20, 56);
+        const cx = Math.round(RENDER_W * 0.5 + i * 110 - camX * 0.26);
+        const cy = Math.round(255 + Math.sin(tick * 0.03 + i) * 8);
+        ctx.fillStyle = '#064e3b';
+        ctx.fillRect(cx - 10, cy - 30, 20, 56);
         ctx.fillStyle = '#10b981';
-        ctx.fillRect(sx - 2, sy - 16, 4, 32);
+        ctx.fillRect(cx - 6, cy - 38, 12, 64);
+        ctx.fillStyle = '#6ee7b7';
+        ctx.fillRect(cx - 4, cy - 36, 4, 58);
       }
     } else if (stage.id === 'coliseum') {
-      // TITAN COLISEUM: Giant Ancient Sword Monument, Grand Arches & Burning Braziers
-      const cx = Math.round(RENDER_W * 0.5 - camX * 0.12);
-      const cy = Math.round(240 - camY * 0.08);
+      // =======================================================================
+      // 5. TITAN COLISEUM: Fallen Pixel Colossus, 3-Tier Arches & Cheering Crowd!
+      // =======================================================================
+      const cx = Math.round(RENDER_W * 0.5 - camX * 0.14);
+      const cy = Math.round(235 - camY * 0.08);
 
-      // Giant planted Greatsword monument in the distance
-      ctx.save();
-      ctx.translate(cx, cy);
-      ctx.rotate(-0.08);
-      ctx.fillStyle = '#27120b';
-      ctx.fillRect(-16, -150, 32, 220); // giant blade
-      ctx.fillStyle = '#431e12';
-      ctx.fillRect(-4, -150, 8, 200); // fuller
-      ctx.fillStyle = '#7c2d12';
-      ctx.fillRect(-58, -156, 116, 16); // crossguard
-      ctx.fillRect(-10, -210, 20, 54); // grip
+      // 1. Colossal Pixel-Art Fallen Titan Skull Helm & Shattered Runic Greatsword!
+      // Titan horned skull & pauldrons in background
+      ctx.fillStyle = '#23100b';
+      ctx.fillRect(cx - 95, cy - 42, 190, 95); // Titan shoulders
+      ctx.fillRect(cx - 42, cy - 92, 84, 56); // Titan great-helm
+      ctx.fillStyle = '#3b1a11';
+      ctx.fillRect(cx - 38, cy - 88, 32, 48);
+      // Giant curved pixel horns on the fallen Titan
+      for (let h = 0; h < 7; h++) {
+        ctx.fillStyle = h > 4 ? '#78350f' : '#451a03';
+        ctx.fillRect(cx - 48 - h * 10, cy - 82 - h * 7, 14, 12);
+        ctx.fillRect(cx + 34 + h * 10, cy - 82 - h * 7, 14, 12);
+      }
+      // Glowing cracked eye sockets of the Titan
+      ctx.fillStyle = '#ea580c';
+      ctx.fillRect(cx - 26, cy - 64, 16, 6);
+      ctx.fillRect(cx + 10, cy - 64, 16, 6);
+      ctx.fillStyle = '#fde047';
+      ctx.fillRect(cx - 20, cy - 63, 6, 4);
+      ctx.fillRect(cx + 14, cy - 63, 6, 4);
+
+      // Colossal Runic Greatsword impaling the Titan's chest
+      ctx.fillStyle = '#1c1917';
+      ctx.fillRect(cx - 18, cy - 205, 36, 175); // Blade body
+      ctx.fillStyle = '#44403c';
+      ctx.fillRect(cx - 16, cy - 205, 10, 170); // Lit blade bevel
+      ctx.fillStyle = '#0c0a09';
+      ctx.fillRect(cx - 4, cy - 195, 8, 155); // Central blood fuller
+      // Glowing molten runes etched down the greatsword fuller
       ctx.fillStyle = '#f97316';
-      ctx.fillRect(-6, -152, 12, 8); // glowing core rune
-      ctx.restore();
+      for (let r = 0; r < 6; r++) {
+        ctx.fillRect(cx - 2, cy - 185 + r * 22, 4, 10);
+      }
+      // Ornate winged pixel crossguard & pommel
+      ctx.fillStyle = '#9a3412';
+      ctx.fillRect(cx - 68, cy - 214, 136, 14);
+      ctx.fillStyle = '#f59e0b';
+      ctx.fillRect(cx - 64, cy - 212, 128, 4);
+      ctx.fillRect(cx - 8, cy - 216, 16, 18);
+      ctx.fillStyle = '#451a03';
+      ctx.fillRect(cx - 9, cy - 260, 18, 44);
+      ctx.fillStyle = '#f59e0b';
+      ctx.fillRect(cx - 14, cy - 272, 28, 12);
 
-      // Background coliseum arches
-      ctx.fillStyle = '#1a0c08';
-      ctx.fillRect(0, 275, RENDER_W, 175);
-      for (let i = -4; i <= 4; i++) {
-        const ax = Math.round(RENDER_W * 0.5 + i * 92 - camX * 0.24);
-        ctx.fillStyle = '#2e150f';
-        ctx.fillRect(ax - 12, 225, 24, 95);
-        // Fire braziers on alternate pillars
-        if (i % 2 === 0) {
-          const flk = Math.sin(tick * 0.25 + i) * 4;
-          ctx.fillStyle = 'rgba(249, 115, 22, 0.24)';
-          ctx.beginPath();
-          ctx.arc(ax, 212, 24, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.fillStyle = '#f97316';
-          ctx.beginPath();
-          ctx.moveTo(ax - 9, 222);
-          ctx.lineTo(ax, 198 + flk);
-          ctx.lineTo(ax + 9, 222);
-          ctx.fill();
-          ctx.fillStyle = '#fde047';
-          ctx.fillRect(ax - 3, 212, 6, 8);
+      // 2. Multi-Tier Pixel-Art Coliseum Stone Arches & Animated Cheering Spectators!
+      const wallTopY = Math.round(238 - camY * 0.14);
+      ctx.fillStyle = '#190b07';
+      ctx.fillRect(0, wallTopY, RENDER_W, RENDER_H - wallTopY);
+
+      const scrollX = Math.round(camX * 0.28);
+      for (let tier = 0; tier < 2; tier++) {
+        const ty = wallTopY + tier * 54;
+        ctx.fillStyle = '#2d140d';
+        ctx.fillRect(0, ty, RENDER_W, 8);
+        ctx.fillStyle = '#431e13';
+        ctx.fillRect(0, ty, RENDER_W, 2);
+
+        for (let col = -2; col < 16; col++) {
+          const ax = col * 64 - ((scrollX % 64 + 64) % 64);
+          // Stone arch pillar
+          ctx.fillStyle = '#2d140d';
+          ctx.fillRect(ax, ty + 8, 16, 46);
+          ctx.fillStyle = '#431e13';
+          ctx.fillRect(ax + 2, ty + 8, 4, 46);
+          // Stepped pixel arch lintel
+          ctx.fillStyle = '#2d140d';
+          ctx.fillRect(ax + 16, ty + 8, 8, 6);
+          ctx.fillRect(ax + 56, ty + 8, 8, 6);
+
+          // Animated Cheering Spectator Silhouettes inside the arch!
+          for (let sp = 0; sp < 4; sp++) {
+            const sx = ax + 20 + sp * 10;
+            const bounce = ((tick + col * 7 + sp * 5) % 16) < 8 ? -2 : 0;
+            const sy = ty + 38 + bounce;
+            ctx.fillStyle = sp % 2 === 0 ? '#0c0504' : '#3b1810';
+            ctx.fillRect(sx, sy, 6, 12); // torso
+            ctx.fillRect(sx + 1, sy - 5, 4, 4); // head
+            // Raised cheering weapon/arm
+            if ((col + sp) % 3 === 0) {
+              ctx.fillRect(sx + 5, sy - 6, 2, 8);
+            }
+          }
+
+          // Hanging Crimson & Gold Legion Banner or Roaring Lion Brazier on pillars
+          if (tier === 0 && col % 2 === 0) {
+            ctx.fillStyle = '#991b1b';
+            ctx.fillRect(ax + 2, ty + 14, 12, 28);
+            ctx.fillStyle = '#f59e0b';
+            ctx.fillRect(ax + 2, ty + 14, 12, 2);
+            ctx.fillRect(ax + 6, ty + 20, 4, 12);
+          } else if (tier === 1 && col % 2 !== 0) {
+            const flk = ((tick + col * 3) % 6) - 3;
+            ctx.fillStyle = '#451a03';
+            ctx.fillRect(ax, ty + 2, 16, 6);
+            ctx.fillStyle = '#ea580c';
+            ctx.fillRect(ax + 2, ty - 8 + flk, 12, 10 - flk);
+            ctx.fillStyle = '#fde047';
+            ctx.fillRect(ax + 5, ty - 4 + flk, 6, 6);
+          }
         }
       }
     } else if (stage.id === 'hypercube') {
-      // CYBER-GRID 3D: True 3D Receding Perspective Horizon Grid & Rotating 4D Tesseract!
-      const horizonY = Math.round(215 - camY * 0.12);
+      // =======================================================================
+      // 6. CYBER-GRID 3D: Cyberpunk Skyline, Neon Billboards, Flying Cars & 4D Core
+      // =======================================================================
+      const horizonY = Math.round(220 - camY * 0.12);
       const vpX = Math.round(RENDER_W * 0.5 - camX * 0.2);
 
-      // 1. 3D Perspective Floor & Ceiling Grids
+      // 1. Dense Pixel-Art Cyberpunk Megacity Skyline & Animated Neon Hologram Signs
+      for (let i = 0; i < 16; i++) {
+        const bw = 42 + (i % 3) * 16;
+        const bh = 85 + ((i * 47) % 105);
+        const bx = Math.round((((i * 62 - camX * 0.14) % (RENDER_W + 120)) + RENDER_W + 120) % (RENDER_W + 120) - 60);
+        const by = horizonY - bh + 18;
+        ctx.fillStyle = '#07051a';
+        ctx.fillRect(bx, by, bw, bh);
+        ctx.fillStyle = '#150d3a';
+        ctx.fillRect(bx + 2, by + 2, 6, bh - 4);
+        // Pixel window grid
+        ctx.fillStyle = i % 2 === 0 ? '#06b6d4' : '#ec4899';
+        for (let wy = by + 10; wy < horizonY + 8; wy += 8) {
+          for (let wx = bx + 10; wx < bx + bw - 8; wx += 8) {
+            if ((wx + wy + i) % 3 !== 0) {
+              ctx.fillRect(wx, wy, 4, 3);
+            }
+          }
+        }
+        // Glowing Neon Rooftop Hologram Billboards
+        if (i % 3 === 0) {
+          const holoCol = i % 2 === 0 ? '#22d3ee' : '#f472b6';
+          ctx.strokeStyle = holoCol;
+          ctx.lineWidth = 1.5;
+          ctx.strokeRect(bx + 6, by - 22, bw - 12, 18);
+          ctx.fillStyle = holoCol;
+          ctx.fillRect(bx + 10, by - 18, bw - 20, 3);
+          ctx.fillRect(bx + 14, by - 12, bw - 28, 5);
+        }
+      }
+
+      // 2. Flying Pixel Spinner Cars streaking across 3 sky-lanes!
+      for (let car = 0; car < 8; car++) {
+        const dir = car % 2 === 0 ? 1 : -1;
+        const speed = 2.5 + (car % 3) * 1.2;
+        const cx = Math.round((((car * 130 + tick * speed * dir) % (RENDER_W + 80)) + RENDER_W + 80) % (RENDER_W + 80) - 40);
+        const cy = 70 + car * 18;
+        ctx.fillStyle = '#1e293b';
+        ctx.fillRect(cx - 6, cy, 12, 4);
+        ctx.fillStyle = dir > 0 ? '#f43f5e' : '#38bdf8';
+        ctx.fillRect(cx - dir * 18, cy + 1, 14, 2); // tail-light streak
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(cx + dir * 5, cy + 1, 3, 2); // headlight
+      }
+
+      // 3. 3D Receding Synthwave Pixel Grid Floor & Rotating 4D Tesseract
       ctx.save();
-      ctx.strokeStyle = 'rgba(6, 182, 212, 0.34)';
+      ctx.strokeStyle = 'rgba(6, 182, 212, 0.36)';
       ctx.lineWidth = 1;
-      // Radial perspective rays from vanishing point
       for (let i = -12; i <= 12; i++) {
         ctx.beginPath();
         ctx.moveTo(vpX + i * 14, horizonY + 18);
         ctx.lineTo(vpX + i * 95, RENDER_H);
         ctx.stroke();
-
-        ctx.beginPath();
-        ctx.moveTo(vpX + i * 14, horizonY - 18);
-        ctx.lineTo(vpX + i * 95, 0);
-        ctx.stroke();
       }
-      // Scrolling horizontal Z-depth lines
       const zOffset = (tick * 0.035) % 1;
       for (let d = 1; d <= 10; d++) {
         const norm = (d - zOffset) / 10;
         const yBot = horizonY + 18 + Math.pow(norm, 2.1) * (RENDER_H - horizonY - 18);
-        const yTop = horizonY - 18 - Math.pow(norm, 2.1) * (horizonY - 18);
-        ctx.strokeStyle = `rgba(6, 182, 212, ${0.12 + norm * 0.38})`;
+        ctx.strokeStyle = `rgba(6, 182, 212, ${0.14 + norm * 0.42})`;
         ctx.beginPath();
         ctx.moveTo(0, Math.round(yBot));
         ctx.lineTo(RENDER_W, Math.round(yBot));
-        ctx.moveTo(0, Math.round(yTop));
-        ctx.lineTo(RENDER_W, Math.round(yTop));
         ctx.stroke();
       }
 
-      // 2. Rotating 3D/4D Projected Hypercube (Tesseract) in the center sky!
       const hx = vpX;
-      const hy = Math.round(135 - camY * 0.08);
+      const hy = Math.round(126 - camY * 0.08);
       const ax = tick * 0.016;
       const ay = tick * 0.022;
       const wPulse = 0.48 + Math.sin(tick * 0.03) * 0.14;
@@ -965,12 +1839,10 @@ export class HDPixelRenderer {
           const vx = (idx & 1 ? 1 : -1) * scale;
           const vy = (idx & 2 ? 1 : -1) * scale;
           const vz = (idx & 4 ? 1 : -1) * scale;
-          // Rotate Y
           const cY = Math.cos(ay + phaseOffset);
           const sY = Math.sin(ay + phaseOffset);
           const rx1 = vx * cY - vz * sY;
           const rz1 = vx * sY + vz * cY;
-          // Rotate X
           const cX = Math.cos(ax);
           const sX = Math.sin(ax);
           const ry2 = vy * cX - rz1 * sX;
@@ -981,16 +1853,14 @@ export class HDPixelRenderer {
         return pts;
       };
 
-      const outerPts = projectVerts(46, 0);
-      const innerPts = projectVerts(46 * wPulse, 0.35);
+      const outerPts = projectVerts(44, 0);
+      const innerPts = projectVerts(44 * wPulse, 0.35);
       const edges = [
         [0, 1], [1, 3], [3, 2], [2, 0],
         [4, 5], [5, 7], [7, 6], [6, 4],
         [0, 4], [1, 5], [2, 6], [3, 7],
       ];
-
-      // 4D hyper-connectors between inner and outer cubes
-      ctx.strokeStyle = 'rgba(232, 121, 249, 0.5)';
+      ctx.strokeStyle = 'rgba(232, 121, 249, 0.55)';
       ctx.lineWidth = 1.2;
       for (let i = 0; i < 8; i++) {
         ctx.beginPath();
@@ -998,18 +1868,16 @@ export class HDPixelRenderer {
         ctx.lineTo(innerPts[i].x, innerPts[i].y);
         ctx.stroke();
       }
-      // Outer cube
       ctx.strokeStyle = '#06b6d4';
-      ctx.lineWidth = 1.8;
+      ctx.lineWidth = 2;
       for (const [a, b] of edges) {
         ctx.beginPath();
         ctx.moveTo(outerPts[a].x, outerPts[a].y);
         ctx.lineTo(outerPts[b].x, outerPts[b].y);
         ctx.stroke();
       }
-      // Inner cube
       ctx.strokeStyle = '#facc15';
-      ctx.lineWidth = 1.4;
+      ctx.lineWidth = 1.5;
       for (const [a, b] of edges) {
         ctx.beginPath();
         ctx.moveTo(innerPts[a].x, innerPts[a].y);
@@ -1018,87 +1886,113 @@ export class HDPixelRenderer {
       }
       ctx.restore();
     } else if (stage.id === 'tesseract') {
-      // MÖBIUS CONTINUUM: Rotating Golden Armillary Spheres & Surreal Floating Staircases
+      // =======================================================================
+      // 7. MÖBIUS CONTINUUM: Clockwork Cathedral Gears, Planet & Escher Stairs
+      // =======================================================================
       const cx = Math.round(RENDER_W * 0.5 - camX * 0.1);
       const cy = Math.round(165 - camY * 0.08);
-      ctx.save();
-      ctx.translate(cx, cy);
-      for (let r = 0; r < 3; r++) {
-        ctx.save();
-        ctx.rotate(tick * (0.01 + r * 0.006) * (r % 2 === 0 ? 1 : -1));
-        ctx.strokeStyle = r === 1 ? 'rgba(250, 204, 21, 0.45)' : 'rgba(192, 132, 252, 0.38)';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.ellipse(0, 0, 105 - r * 20, 42 + r * 16, 0, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.restore();
-      }
-      ctx.restore();
 
-      // Impossible Escher floating stair segments in background
-      ctx.fillStyle = 'rgba(46, 16, 101, 0.7)';
-      ctx.strokeStyle = 'rgba(192, 132, 252, 0.35)';
+      // Ringed Pixel Planet in upper-left cosmos
+      const px = Math.round(165 - camX * 0.05);
+      const py = Math.round(92 - camY * 0.04);
+      this.drawPixelDisc(ctx, px, py, 26, '#6b21a8', '#e879f9', '#3b0764', 2);
+      ctx.strokeStyle = '#fde047';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.ellipse(px, py, 48, 10, -0.25, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Interlocking Pixel-Art Brass & Gold Clockwork Gears
+      this.drawPixelGear(ctx, cx - 64, cy - 18, 52, 12, tick * 0.008, '#451a03', '#b45309', '#facc15');
+      this.drawPixelGear(ctx, cx + 62, cy + 16, 44, 10, -tick * 0.01, '#3b0764', '#7e22ce', '#e879f9');
+      this.drawPixelGear(ctx, cx, cy - 42, 34, 8, -tick * 0.014, '#451a03', '#d97706', '#fef08a');
+
+      // Floating Escher Pixel-Art Marble Staircases & Arcane Pillars
       for (let s = -2; s <= 2; s++) {
         if (s === 0) continue;
         const sx = Math.round(RENDER_W * 0.5 + s * 145 - camX * 0.22);
-        const sy = Math.round(190 + Math.sin(tick * 0.025 + s) * 14);
-        ctx.beginPath();
-        for (let step = 0; step < 5; step++) {
-          ctx.rect(sx + step * 8 * Math.sign(s), sy - step * 7, 10, 18);
+        const sy = Math.round(205 + Math.sin(tick * 0.025 + s) * 12);
+        for (let step = 0; step < 6; step++) {
+          const stX = sx + step * 9 * Math.sign(s);
+          const stY = sy - step * 7;
+          ctx.fillStyle = '#2e1065';
+          ctx.fillRect(stX, stY, 12, 22);
+          ctx.fillStyle = '#c084fc';
+          ctx.fillRect(stX, stY, 12, 3);
+          ctx.fillStyle = '#facc15';
+          ctx.fillRect(stX + 2, stY + 6, 4, 8);
         }
-        ctx.fill();
-        ctx.stroke();
       }
     } else if (stage.id === 'train') {
-      // PHANTOM MAGLEV EXPRESS: High-Speed Parallax Metropolis Skyscrapers & Wind Gusts
-      const speedScroll = tick * 9;
-      // Distant skyline
-      ctx.fillStyle = '#091122';
-      for (let i = 0; i < 14; i++) {
-        const bw = 48 + (i % 3) * 18;
-        const bh = 120 + ((i * 53) % 130);
-        const bx = RENDER_W - (((i * 75 + speedScroll * 0.35) % (RENDER_W + 120)) - 40);
-        ctx.fillRect(Math.round(bx), RENDER_H - 130 - bh, bw, bh);
-        // Neon building window strips
-        ctx.fillStyle = i % 2 === 0 ? 'rgba(56, 189, 248, 0.3)' : 'rgba(244, 63, 94, 0.28)';
-        ctx.fillRect(Math.round(bx + 8), RENDER_H - 120 - bh, 4, bh - 20);
-        ctx.fillRect(Math.round(bx + bw - 14), RENDER_H - 120 - bh, 4, bh - 20);
-        ctx.fillStyle = '#091122';
+      // =======================================================================
+      // 8. PHANTOM MAGLEV: High-Speed Megacity Skyline, Viaduct & Catenary Gantries
+      // =======================================================================
+      const speedScroll = tick * 10;
+
+      // 1. Far Pixel-Art Megacity Skyscrapers with Window Grids
+      for (let i = 0; i < 15; i++) {
+        const bw = 46 + (i % 3) * 18;
+        const bh = 130 + ((i * 53) % 130);
+        const bx = Math.round(RENDER_W - (((i * 74 + speedScroll * 0.3) % (RENDER_W + 120)) - 40));
+        const by = RENDER_H - 125 - bh;
+        ctx.fillStyle = '#070e1c';
+        ctx.fillRect(bx, by, bw, bh);
+        ctx.fillStyle = '#111e36';
+        ctx.fillRect(bx + 2, by + 2, 8, bh - 4);
+        ctx.fillStyle = i % 2 === 0 ? 'rgba(56, 189, 248, 0.38)' : 'rgba(244, 63, 94, 0.34)';
+        for (let wy = by + 10; wy < RENDER_H - 135; wy += 10) {
+          ctx.fillRect(bx + 10, wy, bw - 20, 3);
+        }
       }
 
-      // High-speed overhead steel catenary gantries whipping past
+      // 2. High-Speed Steel Viaduct Bridge & Suspension Cables scrolling beneath the train
+      const bridgeY = Math.round(318 - camY * 0.35);
+      ctx.fillStyle = '#0b1324';
+      ctx.fillRect(0, bridgeY, RENDER_W, 42);
+      ctx.fillStyle = '#1e293b';
+      ctx.fillRect(0, bridgeY, RENDER_W, 4);
+      ctx.fillStyle = '#38bdf8';
+      ctx.fillRect(0, bridgeY + 6, RENDER_W, 2);
+      for (let t = 0; t < 18; t++) {
+        const tx = Math.round(RENDER_W - (((t * 56 + speedScroll * 1.8) % (RENDER_W + 64)) - 32));
+        ctx.fillStyle = '#1e293b';
+        ctx.fillRect(tx, bridgeY + 8, 8, 34);
+        ctx.fillStyle = '#0f172a';
+        ctx.fillRect(tx + 12, bridgeY + 14, 36, 6);
+      }
+
+      // 3. Whipping Overhead Steel Catenary Gantries & Warning Lights
       for (let g = 0; g < 3; g++) {
-        const gx = RENDER_W - (((g * 340 + speedScroll * 1.6) % (RENDER_W + 240)) - 80);
-        ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-        ctx.fillRect(Math.round(gx), 45, 10, RENDER_H - 140);
+        const gx = Math.round(RENDER_W - (((g * 330 + speedScroll * 1.7) % (RENDER_W + 240)) - 80));
+        ctx.fillStyle = '#0f172a';
+        ctx.fillRect(gx, 32, 14, RENDER_H - 115);
+        ctx.fillStyle = '#334155';
+        ctx.fillRect(gx + 2, 32, 4, RENDER_H - 115);
         ctx.fillStyle = '#facc15';
-        ctx.fillRect(Math.round(gx + 2), 85, 6, 18);
+        ctx.fillRect(gx + 2, 78, 10, 20);
+        ctx.fillStyle = '#05070d';
+        ctx.fillRect(gx + 2, 84, 10, 4);
+        ctx.fillRect(gx + 2, 92, 10, 4);
       }
 
-      // Slipstream Wind Gust overlay streaks when wind hazard is active!
+      // 4. Slipstream Wind Gust overlay streaks when wind hazard is active!
       const cycle = tick % 360;
       if (cycle >= 220 && cycle <= 335) {
         const isGusting = cycle >= 240;
-        ctx.strokeStyle = isGusting
-          ? 'rgba(250, 204, 21, 0.55)'
-          : 'rgba(250, 204, 21, 0.22)';
-        ctx.lineWidth = isGusting ? 2 : 1;
-        for (let w = 0; w < 18; w++) {
-          const wx = RENDER_W - (((w * 97 + tick * 26) % (RENDER_W + 160)) - 80);
+        ctx.fillStyle = isGusting ? 'rgba(250, 204, 21, 0.65)' : 'rgba(250, 204, 21, 0.28)';
+        for (let w = 0; w < 20; w++) {
+          const wx = Math.round(RENDER_W - (((w * 97 + tick * 28) % (RENDER_W + 160)) - 80));
           const wy = (w * 37 + 30) % (RENDER_H - 80);
-          ctx.beginPath();
-          ctx.moveTo(wx, wy);
-          ctx.lineTo(wx - (isGusting ? 95 : 42), wy);
-          ctx.stroke();
+          ctx.fillRect(wx - (isGusting ? 96 : 42), wy, isGusting ? 96 : 42, isGusting ? 2 : 1);
         }
       }
     }
 
-    const mist = ctx.createLinearGradient(0, RENDER_H - 110, 0, RENDER_H);
-    mist.addColorStop(0, 'rgba(9, 13, 22, 0)');
-    mist.addColorStop(1, 'rgba(9, 13, 22, 0.76)');
+    const mist = ctx.createLinearGradient(0, RENDER_H - 96, 0, RENDER_H);
+    mist.addColorStop(0, 'rgba(7, 10, 18, 0)');
+    mist.addColorStop(1, 'rgba(7, 10, 18, 0.68)');
     ctx.fillStyle = mist;
-    ctx.fillRect(0, RENDER_H - 110, RENDER_W, 110);
+    ctx.fillRect(0, RENDER_H - 96, RENDER_W, 96);
   }
 
   private drawMountainLayer(
@@ -1109,17 +2003,14 @@ export class HDPixelRenderer {
     amp: number,
     freq: number
   ): void {
+    // Stepped Pixel-Art Mountain Silhouette (4px integer steps)
     ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.moveTo(0, RENDER_H);
-    for (let x = 0; x <= RENDER_W; x += 8) {
+    for (let x = 0; x < RENDER_W; x += 4) {
       const wx = x + offset;
       const h = Math.sin(wx * freq) * amp + Math.cos(wx * freq * 2.1) * (amp * 0.45);
-      ctx.lineTo(x, Math.round(baseY - Math.abs(h)));
+      const topY = Math.round((baseY - Math.abs(h)) / 2) * 2;
+      ctx.fillRect(x, topY, 4, RENDER_H - topY);
     }
-    ctx.lineTo(RENDER_W, RENDER_H);
-    ctx.closePath();
-    ctx.fill();
   }
 
   private drawPlatforms(
@@ -1130,156 +2021,467 @@ export class HDPixelRenderer {
   ): void {
     // 1. Spatial Wrap-Around Portals on Möbius Continuum (`tesseract`)
     if (stage.wrapHorizontal && !isImpact) {
-      const edgeX = stage.wrapEdgeX ?? 300;
+      const edgeX = stage.wrapEdgeX ?? 285;
       for (const side of [-1, 1]) {
         const wx = side * edgeX;
-        ctx.save();
-        ctx.strokeStyle = 'rgba(192, 132, 252, 0.55)';
-        ctx.lineWidth = 2;
-        ctx.setLineDash([6, 6]);
-        ctx.lineDashOffset = -tick * 0.6 * side;
-        ctx.beginPath();
-        ctx.moveTo(wx, -160);
-        ctx.lineTo(wx, 155);
-        ctx.stroke();
-        ctx.restore();
+        // Pixel-art rift pillar
+        ctx.fillStyle = 'rgba(192, 132, 252, 0.22)';
+        ctx.fillRect(wx - 4, -170, 8, 325);
+        for (let py = -165; py < 150; py += 12) {
+          const offset = Math.round(Math.sin(tick * 0.12 + py * 0.08) * 3);
+          ctx.fillStyle = (py + tick) % 24 < 12 ? '#e879f9' : '#facc15';
+          ctx.fillRect(wx - 2 + offset, py, 4, 7);
+        }
       }
     }
 
-    // 2. Render each static or moving platform with bespoke architectural styling
+    // 2. Coupled Train Flexible Gangway Bellows & Energy Conduits between 3 Maglev Cars!
+    if (stage.id === 'train' && !isImpact) {
+      for (const gapX of [-160, 160]) {
+        // Flexible accordion gangway connector
+        ctx.fillStyle = '#0f172a';
+        ctx.fillRect(gapX - 22, 132, 44, 36);
+        ctx.fillStyle = '#1e293b';
+        for (let gx = gapX - 18; gx <= gapX + 14; gx += 6) {
+          ctx.fillRect(gx, 130, 3, 40);
+        }
+        // High-voltage plasma coupling arc
+        ctx.fillStyle = tick % 4 < 2 ? '#facc15' : '#38bdf8';
+        ctx.fillRect(gapX - 22, 146, 44, 3);
+      }
+    }
+
+    // 3. Cloud Pagoda (`dojo`) Vertical Iron Elevator Chains from the Sky
+    if (stage.id === 'dojo' && !isImpact) {
+      for (const rawPlat of stage.platforms) {
+        if (!rawPlat.isMain && rawPlat.motion?.axis === 'y') {
+          const p = resolvePlatformAtTick(rawPlat, tick);
+          const cx = Math.round(p.x);
+          const topY = Math.round(p.top);
+          // Twin pixel iron chains going up to ceiling pulley
+          for (const chainOff of [-p.width * 0.36, p.width * 0.36]) {
+            const chX = Math.round(cx + chainOff);
+            for (let cy = -240; cy < topY; cy += 8) {
+              ctx.fillStyle = '#334155';
+              ctx.fillRect(chX - 2, cy, 4, 5);
+              ctx.fillStyle = '#94a3b8';
+              ctx.fillRect(chX - 1, cy + 1, 2, 3);
+            }
+          }
+        }
+      }
+    }
+
+    // 4. Render each static or moving platform with authentic HD-Pixel Art Tile Masonry!
     for (const rawPlat of stage.platforms) {
       const p = resolvePlatformAtTick(rawPlat, tick);
       const left = Math.round(p.left);
-      const top = Math.round(p.y);
+      const top = Math.round(p.top);
       const w = Math.round(p.width);
       const h = Math.round(p.thickness);
 
       if (p.isMain) {
         if (p.style === 'mirror') {
-          // Sleek Horizon Zero glass-water slab
-          ctx.fillStyle = isImpact ? '#1e293b' : '#091326';
+          // ===================================================================
+          // HORIZON ZERO: Pixel-Art Astral Crystal-Stone Causeway & Water Steps
+          // ===================================================================
+          ctx.fillStyle = isImpact ? '#1e293b' : '#09152b';
           ctx.fillRect(left, top, w, h);
+
+          // Stepped crystal masonry blocks
+          const brickW = 32;
+          for (let row = 0; row < 3; row++) {
+            const by = top + 4 + row * 12;
+            const stagger = (row % 2) * 16;
+            for (let bx = left + 4; bx < left + w - 8; bx += brickW) {
+              const bw = Math.min(brickW - 2, left + w - 4 - bx);
+              ctx.fillStyle = row === 0 ? '#162c4e' : '#0d1e38';
+              ctx.fillRect(bx + (row % 2 === 1 && bx === left + 4 ? 0 : stagger % 8), by, bw, 10);
+              ctx.fillStyle = '#1e40af';
+              ctx.fillRect(bx, by, bw, 2);
+              // Glowing cyan astral rune inlay on top course
+              if (row === 0 && ((bx - left) / brickW) % 2 === 0) {
+                ctx.fillStyle = '#38bdf8';
+                ctx.fillRect(bx + 8, by + 4, bw - 16, 2);
+              }
+            }
+          }
+          // Crisp mirror top rim + animated waterline ripples
           ctx.fillStyle = '#38bdf8';
           ctx.fillRect(left, top, w, 3);
-          ctx.fillStyle = '#ffffff';
-          ctx.fillRect(left + 6, top, w - 12, 1);
-          // Subtle reflection pillars underneath
-          ctx.fillStyle = 'rgba(56, 189, 248, 0.14)';
-          ctx.fillRect(left + 16, top + h, w - 32, 65);
-        } else if (p.style === 'train') {
-          // High-Speed Maglev Bullet Train Car Roof & Body
-          ctx.fillStyle = isImpact ? '#1e293b' : '#0f172a';
-          ctx.fillRect(left, top, w, 54);
-          // Aerodynamic sloped nose/tail bevels
-          ctx.fillStyle = '#1e293b';
-          ctx.fillRect(left + 4, top + 6, w - 8, 38);
-          // Glowing passenger / reactor windows
-          ctx.fillStyle = '#38bdf8';
-          for (let wx = left + 22; wx < left + w - 28; wx += 34) {
-            ctx.fillRect(wx, top + 16, 20, 9);
+          ctx.fillStyle = '#e0f2fe';
+          ctx.fillRect(left + 4, top, w - 8, 1);
+          if (!isImpact) {
+            ctx.fillStyle = '#7dd3fc';
+            for (let rx = left - 12; rx < left + w + 12; rx += 18) {
+              const wave = Math.round(Math.sin(tick * 0.08 + rx * 0.05) * 3);
+              ctx.fillRect(rx + wave, top + h - 2, 10, 2);
+            }
           }
-          // Gold hazard stripe & white roof rail
+        } else if (p.style === 'train') {
+          // ===================================================================
+          // PHANTOM MAGLEV: Pixel-Art Armored Bullet Train Cars (3-Car Convoy!)
+          // ===================================================================
+          const isFrontCar = p.x > 100;
+          const isRearCar = p.x < -100;
+
+          // Main armored car hull
+          ctx.fillStyle = isImpact ? '#1e293b' : '#0f172a';
+          ctx.fillRect(left, top, w, h);
+          ctx.fillStyle = '#1e293b';
+          ctx.fillRect(left + 4, top + 5, w - 8, h - 18);
+          ctx.fillStyle = '#334155';
+          ctx.fillRect(left + 6, top + 6, w - 12, 8);
+
+          // Aerodynamic Front Bullet Nose Cone & Headlights
+          if (isFrontCar && !isImpact) {
+            ctx.fillStyle = '#1e293b';
+            ctx.fillRect(left + w, top + 8, 18, h - 22);
+            ctx.fillRect(left + w + 18, top + 18, 12, h - 32);
+            // Cockpit armored cyan windshield
+            ctx.fillStyle = '#38bdf8';
+            ctx.fillRect(left + w - 16, top + 10, 28, 10);
+            ctx.fillStyle = '#e0f2fe';
+            ctx.fillRect(left + w - 12, top + 11, 20, 3);
+            // Piercing headlight beam
+            ctx.fillStyle = 'rgba(254, 240, 138, 0.24)';
+            ctx.beginPath();
+            ctx.moveTo(left + w + 30, top + 24);
+            ctx.lineTo(left + w + 190, top - 10);
+            ctx.lineTo(left + w + 190, top + 64);
+            ctx.closePath();
+            ctx.fill();
+          }
+
+          // Rear Artillery Car Afterburner Thrusters
+          if (isRearCar && !isImpact) {
+            const jetLen = 22 + (tick % 4) * 6;
+            ctx.fillStyle = '#f97316';
+            ctx.fillRect(left - jetLen, top + 16, jetLen, 14);
+            ctx.fillStyle = '#fde047';
+            ctx.fillRect(left - Math.round(jetLen * 0.65), top + 19, Math.round(jetLen * 0.65), 8);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(left - 10, top + 21, 10, 4);
+          }
+
+          // Illuminated pixel passenger / plasma-reactor windows & vertical steel ribs
+          for (let wx = left + 18; wx < left + w - 28; wx += 32) {
+            // Vertical rivet rib
+            ctx.fillStyle = '#090d16';
+            ctx.fillRect(wx - 6, top + 6, 3, h - 20);
+            // Window frame
+            ctx.fillStyle = '#0284c7';
+            ctx.fillRect(wx, top + 16, 20, 11);
+            ctx.fillStyle = '#7dd3fc';
+            ctx.fillRect(wx + 2, top + 17, 16, 4);
+            ctx.fillStyle = '#e0f2fe';
+            ctx.fillRect(wx + 4, top + 18, 6, 2);
+          }
+
+          // Hazard stripes & non-slip roof walkway
           ctx.fillStyle = '#facc15';
           ctx.fillRect(left, top, w, 3);
-          ctx.fillRect(left, top + 34, w, 2);
+          ctx.fillRect(left + 4, top + 34, w - 8, 3);
+          ctx.fillStyle = '#05070d';
+          for (let hx = left + 8; hx < left + w - 12; hx += 12) {
+            ctx.fillRect(hx, top + 34, 6, 3);
+          }
           ctx.fillStyle = '#f8fafc';
-          ctx.fillRect(left, top, w, 1);
-          // Maglev undercarriage bogies & high-speed rail sparks
+          ctx.fillRect(left + 2, top, w - 4, 1);
+
+          // Undercarriage Maglev Bogies, Coils & High-Speed Rail Sparks
           ctx.fillStyle = '#020617';
-          ctx.fillRect(left + 12, top + 54, w - 24, 14);
+          ctx.fillRect(left + 10, top + h - 14, w - 20, 14);
+          ctx.fillStyle = '#334155';
+          for (let bx = left + 22; bx < left + w - 30; bx += 44) {
+            ctx.fillRect(bx, top + h - 12, 28, 10);
+            ctx.fillStyle = '#38bdf8';
+            ctx.fillRect(bx + 6, top + h - 8, 16, 3);
+            ctx.fillStyle = '#334155';
+          }
           if (!isImpact && tick % 2 === 0) {
             ctx.fillStyle = '#fde047';
-            const sx = left + 20 + ((tick * 19) % Math.max(20, w - 40));
-            ctx.fillRect(sx, top + 64, 8, 2);
+            const sx = left + 18 + ((tick * 23) % Math.max(20, w - 36));
+            ctx.fillRect(sx, top + h - 2, 10, 2);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(sx + 2, top + h - 2, 4, 2);
           }
         } else if (p.style === 'holo') {
-          // 3D Cyber-Grid Neon Wireframe Deck
-          ctx.fillStyle = 'rgba(8, 15, 34, 0.92)';
+          // ===================================================================
+          // CYBER-GRID 3D: Cyberpunk Steel-Girders, Server Cells & Neon Deck
+          // ===================================================================
+          ctx.fillStyle = '#070b19';
           ctx.fillRect(left, top, w, h);
           ctx.strokeStyle = '#06b6d4';
           ctx.lineWidth = 2;
           ctx.strokeRect(left, top, w, h);
-          // Internal diagonal wireframe truss
-          ctx.strokeStyle = 'rgba(6, 182, 212, 0.45)';
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          for (let tx = left; tx < left + w - 20; tx += 25) {
-            ctx.moveTo(tx, top);
-            ctx.lineTo(tx + 25, top + h);
-            ctx.moveTo(tx + 25, top);
-            ctx.lineTo(tx, top + h);
+
+          // Pixel circuit modules & animated data LEDs along the girder
+          for (let cx = left + 10; cx < left + w - 28; cx += 32) {
+            ctx.fillStyle = '#0f172a';
+            ctx.fillRect(cx, top + 6, 24, h - 12);
+            ctx.fillStyle = '#1e293b';
+            ctx.fillRect(cx + 2, top + 8, 20, 6);
+            const ledOn = ((cx + Math.floor(tick * 0.25) * 8) % 32) < 16;
+            ctx.fillStyle = ledOn ? '#22d3ee' : '#ec4899';
+            ctx.fillRect(cx + 4, top + 18, 6, 4);
+            ctx.fillRect(cx + 14, top + 18, 6, 4);
           }
-          ctx.stroke();
-          ctx.fillStyle = '#e0f2fe';
-          ctx.fillRect(left, top, w, 2);
-        } else {
-          // Classic Stone / Obsidian / Gold / Wood Main Stage Foundation
-          ctx.fillStyle = isImpact ? '#1e293b' : '#0f172a';
+          // Downward hover-thruster pods on outer ends & center
+          for (const podOff of [left + 28, Math.round(p.x), left + w - 28]) {
+            ctx.fillStyle = '#1e293b';
+            ctx.fillRect(podOff - 14, top + h, 28, 8);
+            ctx.fillStyle = '#06b6d4';
+            ctx.fillRect(podOff - 10, top + h + 8, 20, 4 + (tick % 3) * 2);
+            ctx.fillStyle = '#e0f2fe';
+            ctx.fillRect(podOff - 5, top + h + 8, 10, 3);
+          }
+          ctx.fillStyle = '#22d3ee';
+          ctx.fillRect(left, top, w, 3);
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(left + 4, top, w - 8, 1);
+        } else if (p.style === 'obsidian') {
+          // ===================================================================
+          // TWIN ABYSS RIFT: Jagged Volcanic Obsidian Fortress & Crystal Teeth
+          // ===================================================================
+          ctx.fillStyle = isImpact ? '#1e293b' : '#061014';
           ctx.fillRect(left, top, w, h);
-          ctx.fillStyle = isImpact ? '#475569' : '#1e293b';
-          ctx.fillRect(left + 4, top + 6, w - 8, h - 10);
-          ctx.fillStyle = '#070a12';
-          ctx.fillRect(left + 22, top + h, w - 44, 210);
-          ctx.fillStyle = '#334155';
-          for (let bx = left + 18; bx < left + w - 24; bx += 42) {
-            ctx.fillRect(bx, top + 8, 18, 2);
+
+          // Layered volcanic basalt courses with glowing emerald ley-lines
+          const courseH = 16;
+          for (let row = 0; row < Math.min(9, Math.floor(h / courseH)); row++) {
+            const ry = top + 4 + row * courseH;
+            const stagger = (row % 2) * 18;
+            for (let bx = left + 4; bx < left + w - 8; bx += 36) {
+              const bw = Math.min(34, left + w - 4 - bx);
+              ctx.fillStyle = row === 0 ? '#112830' : row % 2 === 0 ? '#0b1c22' : '#081419';
+              ctx.fillRect(bx + (stagger % 6), ry, bw, courseH - 2);
+              ctx.fillStyle = '#16353d';
+              ctx.fillRect(bx + (stagger % 6), ry, bw, 2);
+              if (row === 1 && ((bx - left) / 36) % 2 === 0) {
+                ctx.fillStyle = '#10b981';
+                ctx.fillRect(bx + 8, ry + 5, 14, 3);
+              }
+            }
           }
+          // Glowing emerald crystal stalactites jutting from the cliff sides
+          ctx.fillStyle = '#10b981';
+          ctx.fillRect(left - 4, top + 14, 4, 24);
+          ctx.fillRect(left + w, top + 14, 4, 24);
+          ctx.fillRect(left, top, w, 3);
+          ctx.fillStyle = '#a7f3d0';
+          ctx.fillRect(left + 3, top, w - 6, 1);
+        } else if (p.style === 'gold') {
+          // ===================================================================
+          // MÖBIUS CONTINUUM: Ornate Gilded Astral Marble & Clockwork Frieze
+          // ===================================================================
+          ctx.fillStyle = '#170d2e';
+          ctx.fillRect(left, top, w, h);
+          ctx.fillStyle = '#2e1065';
+          ctx.fillRect(left + 4, top + 5, w - 8, h - 10);
+          // Golden Greek-key / celestial filigree frieze blocks
+          for (let gx = left + 12; gx < left + w - 20; gx += 24) {
+            ctx.fillStyle = '#b45309';
+            ctx.fillRect(gx, top + 9, 18, 12);
+            ctx.fillStyle = '#facc15';
+            ctx.fillRect(gx + 2, top + 11, 14, 3);
+            ctx.fillRect(gx + 6, top + 16, 6, 4);
+            ctx.fillStyle = '#c084fc';
+            ctx.fillRect(gx + 7, top + 12, 4, 4);
+          }
+          // Stepped golden corbel base underneath
+          ctx.fillStyle = '#78350f';
+          ctx.fillRect(left + 16, top + h, w - 32, 8);
+          ctx.fillStyle = '#facc15';
+          ctx.fillRect(left, top, w, 3);
+          ctx.fillStyle = '#fef08a';
+          ctx.fillRect(left + 4, top, w - 8, 1);
+        } else {
+          // ===================================================================
+          // STONE & WOOD MAIN FOUNDATIONS (Crimson Torii, Cloud Pagoda, Coliseum)
+          // ===================================================================
+          const isWood = p.style === 'wood';
+          const isColiseum = stage.id === 'coliseum';
+
+          // Deep solid foundation body
+          ctx.fillStyle = isImpact ? '#1e293b' : isColiseum ? '#1c0d08' : isWood ? '#1c110d' : '#0c1322';
+          ctx.fillRect(left, top, w, h);
+
+          // Top heavy curb stones / temple timber beam
+          const brickW = isColiseum ? 40 : 32;
+          for (let bx = left; bx < left + w; bx += brickW) {
+            const bw = Math.min(brickW - 2, left + w - bx);
+            ctx.fillStyle = isColiseum ? '#3b1a10' : isWood ? '#451a03' : '#1e293b';
+            ctx.fillRect(bx + 1, top + 3, bw, 12);
+            ctx.fillStyle = isColiseum ? '#5c2818' : isWood ? '#78350f' : '#334155';
+            ctx.fillRect(bx + 2, top + 4, bw - 2, 3);
+          }
+
+          // Multi-course pixel masonry wall extending down
+          for (let row = 1; row < 8; row++) {
+            const ry = top + 6 + row * 16;
+            if (ry >= top + h - 8) break;
+            const stagger = (row % 2) * (brickW * 0.5);
+            for (let bx = left + 4; bx < left + w - 8; bx += brickW) {
+              const bw = Math.min(brickW - 2, left + w - 4 - bx);
+              const shade = (bx + row * 17) % 3 === 0;
+              ctx.fillStyle = isColiseum
+                ? shade ? '#2a120b' : '#33160e'
+                : isWood
+                ? shade ? '#27150e' : '#311b12'
+                : shade ? '#111c30' : '#17253d';
+              ctx.fillRect(bx + (stagger % 8), ry, bw, 14);
+              ctx.fillStyle = isColiseum ? '#472014' : isWood ? '#4d2719' : '#263859';
+              ctx.fillRect(bx + (stagger % 8), ry, bw, 2);
+            }
+          }
+
+          // Outer reinforced stone corner buttresses (shows solid vertical cliff walls!)
+          ctx.fillStyle = stage.accentColor;
+          ctx.fillRect(left, top, 4, Math.min(90, h));
+          ctx.fillRect(left + w - 4, top, 4, Math.min(90, h));
+
+          // Top surface trim & accent line
           ctx.fillStyle = stage.accentColor;
           ctx.fillRect(left, top, w, 3);
-          ctx.fillStyle = '#e2e8f0';
-          ctx.fillRect(left, top, w, 1);
+          ctx.fillStyle = '#f8fafc';
+          ctx.fillRect(left + 3, top, w - 6, 1);
         }
       } else {
-        // Elevated / Moving Semi-Solid Platforms
-        ctx.fillStyle = p.style === 'holo' ? 'rgba(6, 182, 212, 0.25)' : '#1e293b';
-        ctx.fillRect(left, top, w, h);
-        ctx.fillStyle = stage.accentColor;
-        ctx.fillRect(left, top, w, 2.5);
-        ctx.fillStyle = '#f8fafc';
-        ctx.fillRect(left + 2, top, w - 4, 1);
+        // =====================================================================
+        // ELEVATED & MOVING SOLID PIXEL-ART PLATFORMS (Eaves, Bridges, Drones)
+        // =====================================================================
+        if (p.style === 'wood') {
+          // Japanese Shrine / Pagoda Timber Eave Platform with Curved Ends & Brackets
+          ctx.fillStyle = '#27120b';
+          ctx.fillRect(left, top, w, h);
+          // Upturned eave tips
+          ctx.fillStyle = stage.accentColor;
+          ctx.fillRect(left - 4, top - 2, 6, 4);
+          ctx.fillRect(left + w - 2, top - 2, 6, 4);
+          // Interlocking timber blocks (Dougong brackets)
+          ctx.fillStyle = '#451a03';
+          for (let tx = left + 4; tx < left + w - 8; tx += 16) {
+            ctx.fillRect(tx, top + 3, 12, h - 5);
+            ctx.fillStyle = '#78350f';
+            ctx.fillRect(tx + 1, top + 4, 10, 2);
+            ctx.fillStyle = '#451a03';
+          }
+          // Underside solid beam so players clearly see it is a solid physical block
+          ctx.fillStyle = '#0f0705';
+          ctx.fillRect(left + 2, top + h - 2, w - 4, 2);
+          ctx.fillStyle = stage.accentColor;
+          ctx.fillRect(left, top, w, 2.5);
+          ctx.fillStyle = '#fef3c7';
+          ctx.fillRect(left + 2, top, w - 4, 1);
+        } else if (p.style === 'gold') {
+          // Gilded Tribune / Celestial Platform with Winged Trim
+          ctx.fillStyle = '#451a03';
+          ctx.fillRect(left, top, w, h);
+          ctx.fillStyle = '#b45309';
+          ctx.fillRect(left + 2, top + 2, w - 4, h - 4);
+          for (let gx = left + 8; gx < left + w - 12; gx += 16) {
+            ctx.fillStyle = '#fde047';
+            ctx.fillRect(gx, top + 4, 10, 3);
+          }
+          ctx.fillStyle = '#facc15';
+          ctx.fillRect(left - 2, top, w + 4, 2.5);
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(left + 2, top, w - 4, 1);
+        } else if (p.style === 'obsidian') {
+          // Floating Obsidian Rune Slab with Crystal Underside Teeth
+          ctx.fillStyle = '#061217';
+          ctx.fillRect(left, top, w, h);
+          ctx.fillStyle = '#112a32';
+          ctx.fillRect(left + 3, top + 3, w - 6, h - 5);
+          // Glowing rune slots
+          ctx.fillStyle = '#10b981';
+          for (let rx = left + 10; rx < left + w - 14; rx += 20) {
+            ctx.fillRect(rx, top + 5, 10, 3);
+          }
+          // Hanging crystal teeth underneath
+          ctx.fillStyle = '#064e3b';
+          ctx.fillRect(left + 16, top + h, 10, 5);
+          ctx.fillRect(left + w - 26, top + h, 10, 5);
+          ctx.fillStyle = '#10b981';
+          ctx.fillRect(left, top, w, 2.5);
+          ctx.fillStyle = '#a7f3d0';
+          ctx.fillRect(left + 2, top, w - 4, 1);
+        } else if (p.style === 'holo') {
+          // Cyberpunk Hover-Drone Platform
+          ctx.fillStyle = '#090d1e';
+          ctx.fillRect(left, top, w, h);
+          ctx.strokeStyle = '#06b6d4';
+          ctx.lineWidth = 1.5;
+          ctx.strokeRect(left, top, w, h);
+          ctx.fillStyle = '#ec4899';
+          for (let hx = left + 8; hx < left + w - 12; hx += 18) {
+            ctx.fillRect(hx, top + 4, 10, 3);
+          }
+          ctx.fillStyle = '#22d3ee';
+          ctx.fillRect(left, top, w, 2.5);
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(left + 2, top, w - 4, 1);
+        } else if (p.style === 'train') {
+          // Overhead Catenary Spoiler / Pantograph Deck
+          ctx.fillStyle = '#0f172a';
+          ctx.fillRect(left, top, w, h);
+          ctx.fillStyle = '#334155';
+          for (let tx = left + 6; tx < left + w - 10; tx += 14) {
+            ctx.fillRect(tx, top + 3, 8, h - 5);
+          }
+          ctx.fillStyle = '#facc15';
+          ctx.fillRect(left, top, w, 2.5);
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(left + 2, top, w - 4, 1);
+        } else {
+          // Carved Stone Bastion Deck
+          ctx.fillStyle = '#1c1917';
+          ctx.fillRect(left, top, w, h);
+          for (let sx = left + 4; sx < left + w - 10; sx += 18) {
+            ctx.fillStyle = '#334155';
+            ctx.fillRect(sx, top + 3, 14, h - 5);
+          }
+          ctx.fillStyle = stage.accentColor;
+          ctx.fillRect(left, top, w, 2.5);
+          ctx.fillStyle = '#f8fafc';
+          ctx.fillRect(left + 2, top, w - 4, 1);
+        }
 
         // Thruster / pulley glow under moving platforms
         if (rawPlat.motion && !isImpact) {
           ctx.fillStyle = stage.accentColor;
-          ctx.fillRect(Math.round(p.x - 10), top + h, 20, 3);
+          ctx.fillRect(Math.round(p.x - 12), top + h, 24, 3);
           ctx.fillStyle = '#ffffff';
-          ctx.fillRect(Math.round(p.x - 4), top + h + 1, 8, 2);
+          ctx.fillRect(Math.round(p.x - 5), top + h + 1, 10, 2);
         }
       }
     }
 
-    // 3. Coupled Train Energy Bridge between Left & Right Maglev Cars
-    if (stage.id === 'train' && !isImpact) {
-      ctx.strokeStyle = '#facc15';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(-20, 134);
-      ctx.lineTo(20, 134);
-      ctx.stroke();
-    }
-
-    // 4. Stage Updraft Jump Pads (Twin Abyss Rift & Möbius Continuum)
+    // 5. Stage Updraft Jump Pads (Twin Abyss Rift, Titan Coliseum & Möbius Continuum)
     if (stage.jumpPads && !isImpact) {
       for (const pad of stage.jumpPads) {
         const px = Math.round(pad.x);
         const py = Math.round(pad.y);
         const hw = Math.round(pad.width * 0.5);
-        // Glowing pad base
+        // Pixel-art mechanical / rune jump pad housing
+        ctx.fillStyle = '#090d16';
+        ctx.fillRect(px - hw - 2, py - 4, pad.width + 4, 6);
         ctx.fillStyle = pad.color;
         ctx.fillRect(px - hw, py - 3, pad.width, 4);
         ctx.fillStyle = '#ffffff';
         ctx.fillRect(px - hw + 4, py - 2, pad.width - 8, 2);
-        // Rising animated updraft wind chevrons
+        // Rising animated pixel updraft wind chevrons
         for (let c = 0; c < 3; c++) {
-          const lift = ((tick * 1.4 + c * 11) % 32);
+          const lift = (tick * 1.4 + c * 11) % 32;
           const alpha = 1 - lift / 32;
           ctx.strokeStyle = pad.color;
-          ctx.globalAlpha = alpha * 0.85;
-          ctx.lineWidth = 1.6;
+          ctx.globalAlpha = alpha * 0.88;
+          ctx.lineWidth = 1.8;
           ctx.beginPath();
-          ctx.moveTo(px - 9, py - 6 - lift);
-          ctx.lineTo(px, py - 12 - lift);
-          ctx.lineTo(px + 9, py - 6 - lift);
+          ctx.moveTo(px - 10, py - 6 - lift);
+          ctx.lineTo(px, py - 13 - lift);
+          ctx.lineTo(px + 10, py - 6 - lift);
           ctx.stroke();
         }
         ctx.globalAlpha = 1;
@@ -1565,7 +2767,8 @@ export class HDPixelRenderer {
     vx: number,
     vy: number,
     grounded: boolean,
-    weaponType: WeaponType
+    weaponType: WeaponType,
+    ultPose?: FighterState['ultPose']
   ): SkeletonPose {
     const bulk = weaponType === 'titan' ? 1.24 : 1.0;
     const t = frame * 0.14;
@@ -1771,54 +2974,104 @@ export class HDPixelRenderer {
     }
 
     if (action === 'idle') {
-      const breath = Math.sin(t) * 1.2;
+      const breath = Math.sin(t * 0.72) * 1.15;
+      const sway = Math.cos(t * 0.36) * 0.75;
+      base.hip.x += sway * 0.45;
+      base.hip.y += Math.max(0, breath * 0.35);
+      base.spine.x += sway * 0.65;
+      base.spine.y += breath * 0.6;
+      base.chest.x += sway * 0.85;
       base.chest.y += breath;
-      base.head.y += breath * 1.1;
-      base.handF.y += Math.cos(t) * 1.1;
-      base.handB.y -= Math.cos(t) * 0.9;
+      base.head.x += sway;
+      base.head.y += breath * 1.05;
+      base.shoulderF.y += breath * 0.9;
+      base.shoulderB.y += breath * 0.9;
+      base.elbowF.y += Math.sin(t * 0.72 - 0.4) * 0.9;
+      base.handF.y += Math.sin(t * 0.72 - 0.6) * 1.25;
+      base.elbowB.y -= Math.cos(t * 0.72) * 0.7;
+      base.handB.y -= Math.cos(t * 0.72 - 0.3) * 1.0;
+      base.kneeF.x += sway * 0.35;
+      base.kneeB.x += sway * 0.25;
       return base;
     }
 
     if (action === 'walk' || action === 'dash') {
       const isDash = action === 'dash';
-      const spd = isDash ? 0.56 : 0.28;
+      // Grounded, weighty martial-arts cadence (never frantic or blurry)
+      const spd = isDash ? 0.28 : 0.16;
       const cycle = frame * spd;
+      const speedRatio = clamp01(Math.abs(vx) / (isDash ? 5.2 : 3.2));
+      const strideScale = 0.55 + speedRatio * 0.45;
+      const strideAmp = (isDash ? 14.2 : 9.8) * strideScale;
+      const kneeAmp = (isDash ? 9.6 : 6.8) * strideScale;
+
+      // 4-Phase Biomechanical Gait Solver for each leg (Contact -> Down/Load -> Pass/Drive -> High-Knee Swing)
+      const solveLeg = (phaseAngle: number, sideOffset: number) => {
+        const s = Math.sin(phaseAngle);
+        const c = Math.cos(phaseAngle);
+        // Swing phase occurs when c > 0 (leg moving from back to front through the air)
+        const swingPhase = Math.max(0, c);
+        const highKnee = Math.pow(swingPhase, 1.25) * (isDash ? 7.8 : 4.8) * strideScale;
+        const heelLift = Math.max(0, Math.sin(phaseAngle - 0.55)) * (isDash ? 8.8 : 5.2) * strideScale;
+        const footX = s * strideAmp + sideOffset * 0.4;
+        const footY = 18 - heelLift;
+        // Anatomical knee bends forward of the hip-to-foot line during the swing phase
+        const kneeForwardLead = swingPhase * (isDash ? 5.2 : 3.4);
+        const kneeX = s * kneeAmp + sideOffset + kneeForwardLead;
+        const kneeY = 8.5 - highKnee * 0.78;
+        return { knee: { x: kneeX, y: kneeY }, foot: { x: footX, y: footY } };
+      };
+
+      const legF = solveLeg(cycle, 2.2);
+      const legB = solveLeg(cycle + Math.PI, -1.8);
+
       const stride = Math.sin(cycle);
-      const liftF = Math.max(0, Math.cos(cycle)) * (isDash ? 7 : 4.5);
-      const liftB = Math.max(0, -Math.cos(cycle)) * (isDash ? 7 : 4.5);
-      const lean = isDash ? 9.5 : 4.0;
-      const bob = Math.abs(stride) * (isDash ? 2.2 : 1.3);
+      // Double-frequency vertical center-of-mass bounce (lowest at heel-strike/absorption, highest at mid-pass)
+      const bounce = Math.sin(cycle * 2 - 0.35) * (isDash ? 1.85 : 1.15) * strideScale;
+      const speedLean = Math.min(3.8, Math.abs(vx) * 0.55);
+      const lean = (isDash ? 7.8 : 3.2) + speedLean;
+      const torsoTwist = stride * (isDash ? 2.6 : 1.55) * strideScale;
+      const armSwing = stride * (isDash ? 8.5 : 5.6) * strideScale;
 
       return {
         ...base,
-        hip: { x: isDash ? 2 : 0, y: -1 + bob },
-        spine: { x: lean * 0.5, y: -8 + bob },
-        chest: { x: lean, y: -13.5 + bob },
-        head: { x: lean + 3.5, y: -22.5 + bob },
-        shoulderF: { x: lean + 1, y: -12.5 + bob },
-        shoulderB: { x: lean - 2, y: -12.5 + bob },
-        kneeF: { x: stride * (isDash ? 10 : 7) + 3, y: 8 - liftF * 0.5 },
-        footF: { x: stride * (isDash ? 15 : 11), y: 18 - liftF },
-        kneeB: { x: -stride * (isDash ? 10 : 7), y: 8 - liftB * 0.5 },
-        footB: { x: -stride * (isDash ? 15 : 11), y: 18 - liftB },
-        elbowF: { x: lean - stride * 6, y: -9 + bob },
-        handF: {
-          x: isDash && weaponType === 'dagger' ? -8 : lean - stride * 10 + 3,
-          y: isDash && weaponType === 'dagger' ? -6 : -6 + bob,
+        hip: { x: (isDash ? 1.8 : 0.6) + stride * 0.6, y: -0.6 + bounce },
+        spine: { x: lean * 0.52, y: -8 + bounce * 0.9 },
+        chest: { x: lean, y: -14 + bounce * 0.85 },
+        head: { x: lean + 3.2, y: -23.2 + bounce * 0.7 },
+        shoulderF: { x: lean + 1.6 - torsoTwist, y: -13 + bounce * 0.85 },
+        shoulderB: { x: lean - 2.0 + torsoTwist, y: -13 + bounce * 0.85 },
+        kneeF: legF.knee,
+        footF: legF.foot,
+        kneeB: legB.knee,
+        footB: legB.foot,
+        elbowF: {
+          x: lean - armSwing * 0.75 + 1.5,
+          y: -9.2 + bounce + Math.abs(stride) * 1.1,
         },
-        elbowB: { x: lean + stride * 6 - 3, y: -9 + bob },
-        handB: { x: lean + stride * 9 - 5, y: -5 + bob },
-        weaponAngle: isDash ? 2.65 : -0.9,
+        handF: {
+          x: isDash && weaponType === 'dagger' ? -8.5 : lean - armSwing * 1.15 + 4.5,
+          y: isDash && weaponType === 'dagger' ? -5.5 : -6.2 + bounce - Math.max(0, -stride) * 2.2,
+        },
+        elbowB: {
+          x: lean + armSwing * 0.75 - 2.8,
+          y: -9.2 + bounce + Math.abs(stride) * 1.1,
+        },
+        handB: {
+          x: lean + armSwing * 1.1 - 4.2,
+          y: -5.5 + bounce - Math.max(0, stride) * 2.2,
+        },
+        weaponAngle: isDash ? 2.65 : -0.78 + stride * 0.14,
         sheathed: weaponType === 'katana' && !isDash ? true : false,
       };
     }
 
     if (action === 'parry') {
       // Crisp defensive deflection guard stance (`P` while standing still)
-      const brace = easeOutExpo(Math.min(1, frame / 4));
-      return {
+      const brace = easeOutCubic(Math.min(1, frame / 5));
+      return blendPose(base, {
         ...base,
-        hip: { x: -1.5 * brace, y: 0 },
+        hip: { x: -1.5, y: 0 },
         spine: { x: 0, y: -7.5 },
         chest: { x: 1, y: -14.5 },
         head: { x: 2.5, y: -24 },
@@ -1833,68 +3086,151 @@ export class HDPixelRenderer {
         weaponAngle: -1.35, // Vertical/diagonal guard blade
         weaponReach: base.weaponReach + 2,
         sheathed: false,
-      };
+      }, brace);
     }
 
     if (action === 'jump_squat') {
-      return {
+      const coil = easeOutCubic(Math.min(1, frame / 3));
+      return blendPose(base, {
         ...base,
-        hip: { x: -1, y: 4 },
-        spine: { x: 1.5, y: -3 },
-        chest: { x: 3.5, y: -9.5 },
-        head: { x: 5, y: -18.5 },
-        kneeF: { x: 9, y: 11 },
-        kneeB: { x: -7, y: 11 },
+        hip: { x: -1.5, y: 4.5 },
+        spine: { x: 1.5, y: -2.5 },
+        chest: { x: 4, y: -9 },
+        head: { x: 5.5, y: -18 },
+        kneeF: { x: 9.5, y: 11.5 },
+        kneeB: { x: -7.5, y: 11.5 },
         handF: { x: -5, y: 2 },
         handB: { x: -9, y: 0 },
-      };
+      }, coil);
     }
 
     if (action === 'air' || action === 'airdodge') {
-      const rising = vy < 0;
-      const tilt = Math.sign(vx) * facing * 2.8;
+      // Continuous vertical velocity blend between rising tuck, apex float, and falling brace
+      const riseFactor = clamp01((-vy + 1.5) / 4.5);
+      const tilt = Math.max(-5, Math.min(5, vx * facing * 0.72));
+      const vyStretch = Math.max(-3.0, Math.min(3.0, vy * 0.32));
       return {
         ...base,
-        hip: { x: 0, y: -2 },
-        spine: { x: tilt * 0.5, y: -9 },
-        chest: { x: tilt, y: -15.5 },
-        head: { x: tilt + 1.5, y: -25 },
-        kneeF: { x: 7.5, y: rising ? 2 : 6.5 },
-        footF: { x: 4, y: rising ? 10 : 15.5 },
-        kneeB: { x: -6, y: rising ? 5 : 8.5 },
-        footB: { x: -9.5, y: rising ? 12.5 : 16.5 },
-        elbowF: { x: 8, y: rising ? -15 : -12 },
-        handF: { x: 12, y: rising ? -19 : -14 },
-        elbowB: { x: -8, y: rising ? -14 : -11 },
-        handB: { x: -12, y: rising ? -16 : -10 },
-        weaponAngle: rising ? -1.1 : -0.45,
+        hip: { x: -tilt * 0.2, y: -2 },
+        spine: { x: tilt * 0.5, y: -9 - vyStretch * 0.2 },
+        chest: { x: tilt, y: -15.5 - vyStretch * 0.35 },
+        head: { x: tilt + 1.8, y: -25 - vyStretch * 0.4 },
+        kneeF: { x: 7.8 + tilt * 0.3, y: lerp(6.5, 1.5, riseFactor) },
+        footF: { x: 4 + tilt * 0.2, y: lerp(15.5, 9.5, riseFactor) },
+        kneeB: { x: -6 - tilt * 0.2, y: lerp(8.5, 4.5, riseFactor) },
+        footB: { x: -9.5 - tilt * 0.3, y: lerp(16.5, 12.0, riseFactor) },
+        elbowF: { x: 8 + tilt * 0.4, y: lerp(-12 + vyStretch * 0.5, -15, riseFactor) },
+        handF: { x: 12.5 + tilt * 0.5, y: lerp(-14 + vyStretch * 0.7, -19.5, riseFactor) },
+        elbowB: { x: -8, y: lerp(-11 + vyStretch * 0.5, -14, riseFactor) },
+        handB: { x: -12.5, y: lerp(-10 + vyStretch * 0.7, -16.5, riseFactor) },
+        weaponAngle: lerp(-0.42 + vyStretch * 0.08, -1.15, riseFactor),
         sheathed: false,
       };
     }
 
     if (action === 'hitstun') {
-      const recoil = Math.sin(frame * 0.8) * 1.5;
+      // Dedicated 2.5D Ultimate Victim Choreography Poses (Smooth recoil & reaction curves)
+      if (ultPose === 'ult_victim_gut') {
+        const shudder = Math.sin(frame * 0.85) * 1.2;
+        return {
+          ...base,
+          hip: { x: -4 + shudder, y: 2 },
+          spine: { x: 2 + shudder, y: -4 },
+          chest: { x: 8 + shudder, y: -9 },
+          head: { x: 13 + shudder, y: -15 },
+          elbowF: { x: 4, y: -3 },
+          handF: { x: 1, y: 2 },
+          elbowB: { x: -2, y: -4 },
+          handB: { x: 0, y: 2 },
+          kneeF: { x: 3, y: 10 },
+          footF: { x: -2, y: 18 },
+          kneeB: { x: -6, y: 11 },
+          footB: { x: -11, y: 18 },
+          weaponAngle: 1.4,
+        };
+      }
+      if (ultPose === 'ult_victim_recoil') {
+        const snap = Math.sin(frame * 0.48) * 3.0;
+        return {
+          ...base,
+          hip: { x: -3, y: 0 },
+          spine: { x: -7, y: -7 },
+          chest: { x: -11 + snap * 0.5, y: -13 },
+          head: { x: -16 + snap, y: -21 - Math.abs(snap) * 0.4 },
+          elbowF: { x: 8, y: -18 },
+          handF: { x: 15, y: -25 },
+          elbowB: { x: -13, y: -15 },
+          handB: { x: -20, y: -21 },
+          kneeF: { x: 9, y: 8 },
+          footF: { x: 14, y: 18 },
+          kneeB: { x: -7, y: 9 },
+          footB: { x: -12, y: 18 },
+          weaponAngle: -2.4,
+        };
+      }
+      if (ultPose === 'ult_victim_ground') {
+        const bounce = Math.sin(frame * 0.65) * 1.2;
+        return {
+          ...base,
+          hip: { x: 0, y: 11 + bounce },
+          spine: { x: -8, y: 12 + bounce },
+          chest: { x: -15, y: 11 + bounce },
+          head: { x: -22, y: 13 + bounce },
+          elbowF: { x: -12, y: 15 },
+          handF: { x: -6, y: 18 },
+          elbowB: { x: -19, y: 14 },
+          handB: { x: -25, y: 17 },
+          kneeF: { x: 9, y: 13 },
+          footF: { x: 17, y: 17 },
+          kneeB: { x: 7, y: 15 },
+          footB: { x: 14, y: 18 },
+          weaponAngle: 0.15,
+        };
+      }
+      if (ultPose === 'ult_victim_air') {
+        const spin = Math.sin(frame * 0.35) * 2.8;
+        return {
+          ...base,
+          hip: { x: 0, y: -2 },
+          spine: { x: -5, y: -8 },
+          chest: { x: -9, y: -14 },
+          head: { x: -14, y: -20 + spin * 0.5 },
+          elbowF: { x: 6, y: -20 + spin },
+          handF: { x: 12, y: -27 + spin },
+          elbowB: { x: -14, y: -18 - spin },
+          handB: { x: -21, y: -24 - spin },
+          kneeF: { x: 8, y: 4 },
+          footF: { x: 13, y: 11 },
+          kneeB: { x: -8, y: 6 },
+          footB: { x: -14, y: 13 },
+          weaponAngle: -2.6,
+        };
+      }
+
+      const recoil = Math.sin(frame * 0.65) * 1.4;
+      const kbX = Math.max(-6, Math.min(6, -vx * facing * 0.55));
+      const kbY = Math.max(-4, Math.min(5, -vy * 0.4));
       return {
         ...base,
-        hip: { x: -2, y: -1 },
-        spine: { x: -4.5, y: -7.5 },
-        chest: { x: -6.5 + recoil, y: -13.5 },
-        head: { x: -9.5 + recoil, y: -22 },
-        elbowF: { x: 5, y: -16 },
-        handF: { x: 10, y: -21 },
-        elbowB: { x: -10, y: -12 },
-        handB: { x: -15, y: -16 },
-        kneeF: { x: 7, y: 6 },
-        footF: { x: 11, y: 12 },
-        kneeB: { x: -6, y: 9 },
-        footB: { x: -10, y: 16 },
-        weaponAngle: -2.2,
+        hip: { x: -2 + kbX * 0.3, y: -1 + kbY * 0.2 },
+        spine: { x: -4.5 + kbX * 0.6, y: -7.5 + kbY * 0.5 },
+        chest: { x: -6.8 + kbX + recoil, y: -13.5 + kbY * 0.8 },
+        head: { x: -10 + kbX * 1.2 + recoil, y: -22 + kbY },
+        elbowF: { x: 5 + kbX * 0.5, y: -16 + kbY },
+        handF: { x: 10 + kbX * 0.8, y: -21 + kbY * 1.2 },
+        elbowB: { x: -10 + kbX * 0.5, y: -12 + kbY },
+        handB: { x: -15 + kbX * 0.8, y: -16 + kbY * 1.2 },
+        kneeF: { x: 7 - kbX * 0.3, y: 6 - kbY * 0.4 },
+        footF: { x: 11 - kbX * 0.5, y: 12 - kbY * 0.6 },
+        kneeB: { x: -6 - kbX * 0.3, y: 9 },
+        footB: { x: -10 - kbX * 0.5, y: 16 },
+        weaponAngle: -2.25 + kbX * 0.08,
       };
     }
 
     if (action === 'kuro_suspend') {
       // Mid-air zero-gravity coiled assassin pose
-      const hover = Math.sin(frame * 0.35) * 1.5;
+      const hover = Math.sin(frame * 0.25) * 1.5;
       return {
         ...base,
         hip: { x: -2, y: 0 + hover },
@@ -1932,8 +3268,9 @@ export class HDPixelRenderer {
     }
 
     if (action === 'strong_charge') {
-      const tremble = Math.sin(frame * 1.6) * 1.2;
-      return {
+      const coil = easeOutCubic(Math.min(1, frame / 10));
+      const tremble = Math.sin(frame * 0.9) * 0.85;
+      return blendPose(base, {
         ...base,
         hip: { x: -3 + tremble * 0.5, y: 1.5 },
         spine: { x: -4.5 + tremble, y: -6 },
@@ -1950,13 +3287,13 @@ export class HDPixelRenderer {
         weaponAngle: -2.65,
         weaponReach: base.weaponReach + 3,
         sheathed: weaponType === 'katana',
-      };
+      }, coil);
     }
 
     if (action === 'taunt') {
       // Signature character taunt flourish pose!
-      const wave = Math.sin(frame * 0.35);
-      const bob = Math.cos(frame * 0.35) * 1.5;
+      const wave = Math.sin(frame * 0.24);
+      const bob = Math.cos(frame * 0.24) * 1.4;
       return {
         ...base,
         hip: { x: 0, y: -1 + bob * 0.5 },
@@ -1978,83 +3315,432 @@ export class HDPixelRenderer {
     }
 
     if (action === 'ultimate') {
-      // 3-Phase Ultimate Pose: Cutscene Awakening (0..44) -> Telegraph Channel (45..82) -> Cataclysm Strike (83..135)
-      if (frame <= 44) {
-        const hover = Math.sin(frame * 0.3) * 2;
+      const p = ultPose ?? 'ult_charge';
+      // Local beat frame inside Act III 30-frame beats (127..306)
+      const beatLocal = frame >= 127 && frame <= 306 ? (frame - 127) % 30 : frame % 30;
+      const beatSwing = easeInOutCubic(Math.min(1, beatLocal / 9));
+
+      // 1. Act I Low-Angle Hero Charge Pose ('ult_charge')
+      if (p === 'ult_charge') {
+        const readyBlend = easeInOutCubic(clamp01((frame - 22) / 20));
+        const breathe = Math.sin(frame * 0.18) * 1.4;
+        if (weaponType === 'katana') {
+          return {
+            ...base,
+            hip: { x: -2, y: 2.5 + breathe * 0.5 },
+            spine: { x: 2, y: -5 + breathe * 0.5 },
+            chest: { x: 5.5, y: -11.5 + breathe },
+            head: { x: 8, y: -21 + breathe },
+            elbowF: { x: 2, y: -5 },
+            handF: { x: -1, y: 1 },
+            elbowB: { x: -6, y: -6 },
+            handB: { x: -4, y: 1 },
+            kneeF: { x: 11, y: 10 },
+            footF: { x: 15, y: 18 },
+            kneeB: { x: -9, y: 11 },
+            footB: { x: -14, y: 18 },
+            weaponAngle: 2.78,
+            weaponReach: base.weaponReach + 5,
+            sheathed: true,
+          };
+        }
         return {
           ...base,
-          hip: { x: -1, y: -3 + hover },
-          spine: { x: 1, y: -11 + hover },
-          chest: { x: 3, y: -18 + hover },
-          head: { x: 4, y: -28 + hover },
-          elbowF: { x: 9, y: -23 + hover },
-          handF: { x: 14, y: -33 + hover },
-          elbowB: { x: -8, y: -19 + hover },
-          handB: { x: -13, y: -27 + hover },
-          kneeF: { x: 8, y: 4 + hover },
-          footF: { x: 5, y: 13 + hover },
-          kneeB: { x: -6, y: 7 + hover },
-          footB: { x: -9, y: 16 + hover },
-          weaponAngle: weaponType === 'katana' ? 2.75 : -Math.PI * 0.55,
+          hip: { x: -2, y: lerp(0, 2, readyBlend) + breathe * 0.5 },
+          spine: { x: lerp(1, 3, readyBlend), y: -6 + breathe * 0.5 },
+          chest: { x: lerp(3, 7, readyBlend), y: -13 + breathe },
+          head: { x: lerp(4.5, 9, readyBlend), y: -23 + breathe },
+          elbowF: { x: lerp(7, 14, readyBlend), y: lerp(-11, -20, readyBlend) },
+          handF: { x: lerp(11, 21, readyBlend), y: lerp(-7, -28, readyBlend) },
+          elbowB: { x: -9, y: -12 },
+          handB: { x: -15, y: -16 },
+          kneeF: { x: 10, y: 9 },
+          footF: { x: 14, y: 18 },
+          kneeB: { x: -8, y: 10 },
+          footB: { x: -13, y: 18 },
+          weaponAngle: lerpAngle(-2.35, -Math.PI * 0.42, readyBlend),
+          weaponReach: base.weaponReach + 6,
+          sheathed: false,
+        };
+      }
+
+      // 2. Act II & Beat 3 High-Speed Sprint Pose ('ult_sprint')
+      if (p === 'ult_sprint') {
+        const cyc = frame * 0.36;
+        const stride = Math.sin(cyc);
+        const bob = Math.sin(cyc * 2 - 0.3) * 1.8;
+        return {
+          ...base,
+          hip: { x: 4.5, y: 1.2 + bob },
+          spine: { x: 9.5, y: -5.2 + bob },
+          chest: { x: 13.5, y: -11.2 + bob },
+          head: { x: 17, y: -19.8 + bob },
+          kneeF: { x: 6.5 + stride * 11.5, y: 8 - Math.max(0, Math.cos(cyc)) * 5.2 },
+          footF: { x: 4.5 + stride * 16.5, y: 18 - Math.max(0, Math.cos(cyc)) * 6.8 },
+          kneeB: { x: 6.5 - stride * 11.5, y: 8 - Math.max(0, -Math.cos(cyc)) * 5.2 },
+          footB: { x: 4.5 - stride * 16.5, y: 18 - Math.max(0, -Math.cos(cyc)) * 6.8 },
+          elbowF: { x: 2 - stride * 7.5, y: -10 + bob },
+          handF: { x: -7 - stride * 9.5, y: -12 + bob },
+          elbowB: { x: 14 + stride * 6.5, y: -10 + bob },
+          handB: { x: 21 + stride * 8.5, y: -12 + bob },
+          weaponAngle: weaponType === 'katana' ? 2.85 : -2.6,
           weaponReach: base.weaponReach + 5,
           sheathed: weaponType === 'katana',
         };
-      } else if (frame <= 82) {
-        const tremble = Math.sin(frame * 1.8) * 1.4;
+      }
+
+      // 3. Beat 0 Armor-Piercing Gut-Strike / Hilt-Smash ('ult_gut_strike')
+      if (p === 'ult_gut_strike') {
+        const coilPose: SkeletonPose = {
+          ...base,
+          hip: { x: -3, y: 2 },
+          spine: { x: -4, y: -5 },
+          chest: { x: -5, y: -12 },
+          head: { x: -2, y: -21 },
+          elbowF: { x: -8, y: -11 },
+          handF: { x: -14, y: -13 },
+          elbowB: { x: 6, y: -10 },
+          handB: { x: 12, y: -12 },
+          kneeF: { x: 9, y: 9 },
+          footF: { x: 13, y: 18 },
+          kneeB: { x: -9, y: 10 },
+          footB: { x: -15, y: 18 },
+          weaponAngle: -2.4,
+          weaponReach: base.weaponReach + 4,
+          sheathed: false,
+        };
+        const strikePose: SkeletonPose = {
+          ...base,
+          hip: { x: 7, y: 1 },
+          spine: { x: 12, y: -6 },
+          chest: { x: 16, y: -12 },
+          head: { x: 19, y: -21 },
+          elbowF: { x: 22, y: -10 },
+          handF: { x: 33, y: -8 },
+          elbowB: { x: -5, y: -11 },
+          handB: { x: -13, y: -9 },
+          kneeF: { x: 15, y: 8 },
+          footF: { x: 21, y: 18 },
+          kneeB: { x: -10, y: 10 },
+          footB: { x: -17, y: 18 },
+          weaponAngle: 0.05,
+          weaponReach: base.weaponReach + 9,
+          sheathed: false,
+          smearAlpha: beatLocal < 14 ? 0.85 : 0.25,
+          smearSpan: 1.8,
+        };
+        return blendStrikeSwingPose(coilPose, strikePose, beatSwing);
+      }
+
+      // 4. Beat 1 Cross-Up 2.5D Flank Spinning Kick / Reverse Cleave ('ult_flank_slash')
+      if (p === 'ult_flank_slash') {
+        const coilPose: SkeletonPose = {
+          ...base,
+          hip: { x: -2, y: 1 },
+          spine: { x: -3, y: -6 },
+          chest: { x: -4, y: -13 },
+          head: { x: -1, y: -22 },
+          elbowF: { x: -7, y: -14 },
+          handF: { x: -13, y: -18 },
+          elbowB: { x: 5, y: -11 },
+          handB: { x: 11, y: -14 },
+          kneeF: { x: 6, y: 6 },
+          footF: { x: 4, y: 14 },
+          kneeB: { x: -6, y: 9 },
+          footB: { x: -10, y: 18 },
+          weaponAngle: 2.2,
+          weaponReach: base.weaponReach + 5,
+          sheathed: false,
+        };
+        const strikePose: SkeletonPose = {
+          ...base,
+          hip: { x: 3, y: -2 },
+          spine: { x: 7, y: -9 },
+          chest: { x: 11, y: -15 },
+          head: { x: 14, y: -24 },
+          elbowF: { x: 19, y: -18 },
+          handF: { x: 29, y: -22 },
+          elbowB: { x: -8, y: -14 },
+          handB: { x: -16, y: -18 },
+          kneeF: { x: 15, y: -2 },
+          footF: { x: 26, y: -6 },
+          kneeB: { x: -4, y: 9 },
+          footB: { x: -7, y: 18 },
+          weaponAngle: -0.58,
+          weaponReach: base.weaponReach + 10,
+          sheathed: false,
+          smearAlpha: beatLocal < 14 ? 0.88 : 0.25,
+          smearSpan: 2.2,
+        };
+        return blendStrikeSwingPose(coilPose, strikePose, beatSwing);
+      }
+
+      // 5. Beat 2 Close-Quarters Martial & Weapon Combination ('ult_rapid_flurry')
+      if (p === 'ult_rapid_flurry') {
+        // Smooth continuous 3-hit martial-arts combination over the 30-frame beat (10 frames per strike)
+        const comboPhase = (beatLocal % 10) / 10;
+        const strikeIdx = Math.floor(beatLocal / 10) % 3;
+        const swingCurve = Math.sin(comboPhase * Math.PI);
+        const alt = strikeIdx === 1 ? -1 : 1;
+        const isKick = strikeIdx === 2;
         return {
           ...base,
-          hip: { x: -3 + tremble * 0.5, y: 1 },
+          hip: { x: 3 + swingCurve * 3.5, y: 0 },
+          spine: { x: 7 + swingCurve * 4, y: -7.5 },
+          chest: { x: 10.5 + swingCurve * 5, y: -13.5 },
+          head: { x: 13 + swingCurve * 4.5, y: -22.5 },
+          elbowF: { x: 10 + swingCurve * 12, y: -12 + alt * 4 * swingCurve },
+          handF: { x: 16 + swingCurve * 16, y: -10 + alt * 8 * swingCurve },
+          elbowB: { x: 10 - swingCurve * 8, y: -11 - alt * 3 * swingCurve },
+          handB: { x: 16 - swingCurve * 12, y: -9 - alt * 6 * swingCurve },
+          kneeF: {
+            x: isKick ? 8 + swingCurve * 10 : 11,
+            y: isKick ? 8 - swingCurve * 9 : 8,
+          },
+          footF: {
+            x: isKick ? 12 + swingCurve * 16 : 16,
+            y: isKick ? 18 - swingCurve * 22 : 18,
+          },
+          kneeB: { x: -8, y: 9 },
+          footB: { x: -14, y: 18 },
+          weaponAngle: lerpAngle(-1.6 * alt, 0.55 * alt, easeInOutCubic(comboPhase)),
+          weaponReach: base.weaponReach + 5 + swingCurve * 5,
+          sheathed: false,
+          smearAlpha: 0.35 + swingCurve * 0.55,
+          smearSpan: 1.9,
+        };
+      }
+
+      // 6. Beat 4 Overhead Earth-Shattering Slam ('ult_heavy_slam')
+      if (p === 'ult_heavy_slam') {
+        const highRaisePose: SkeletonPose = {
+          ...base,
+          hip: { x: -1, y: -3 },
+          spine: { x: 1, y: -11 },
+          chest: { x: 3, y: -19 },
+          head: { x: 5, y: -28 },
+          elbowF: { x: 4, y: -26 },
+          handF: { x: 2, y: -36 },
+          elbowB: { x: -2, y: -24 },
+          handB: { x: -4, y: -34 },
+          kneeF: { x: 9, y: 4 },
+          footF: { x: 6, y: 13 },
+          kneeB: { x: -6, y: 6 },
+          footB: { x: -10, y: 15 },
+          weaponAngle: -2.1,
+          weaponReach: base.weaponReach + 8,
+          sheathed: false,
+        };
+        const slamPose: SkeletonPose = {
+          ...base,
+          hip: { x: 4, y: 3 },
+          spine: { x: 9, y: -3 },
+          chest: { x: 14, y: -8 },
+          head: { x: 17, y: -16 },
+          elbowF: { x: 18, y: -2 },
+          handF: { x: 25, y: 8 },
+          elbowB: { x: 12, y: -3 },
+          handB: { x: 19, y: 7 },
+          kneeF: { x: 13, y: 10 },
+          footF: { x: 18, y: 18 },
+          kneeB: { x: -9, y: 11 },
+          footB: { x: -15, y: 18 },
+          weaponAngle: 0.78,
+          weaponReach: base.weaponReach + 11,
+          sheathed: false,
+          smearAlpha: beatLocal < 16 ? 0.92 : 0.25,
+          smearSpan: 2.4,
+        };
+        return blendStrikeSwingPose(highRaisePose, slamPose, easeInOutCubic(Math.min(1, beatLocal / 12)));
+      }
+
+      // 7. Beat 5 Skyward Uppercut Launcher ('ult_launcher')
+      if (p === 'ult_launcher') {
+        const crouchCoil: SkeletonPose = {
+          ...base,
+          hip: { x: -2, y: 4 },
+          spine: { x: 2, y: -3 },
+          chest: { x: 5, y: -9 },
+          head: { x: 7, y: -18 },
+          elbowF: { x: 4, y: -3 },
+          handF: { x: 8, y: 5 },
+          elbowB: { x: -6, y: -5 },
+          handB: { x: -10, y: 1 },
+          kneeF: { x: 11, y: 11 },
+          footF: { x: 15, y: 18 },
+          kneeB: { x: -8, y: 11 },
+          footB: { x: -13, y: 18 },
+          weaponAngle: 1.25,
+          weaponReach: base.weaponReach + 6,
+          sheathed: false,
+        };
+        const launchPose: SkeletonPose = {
+          ...base,
+          hip: { x: 2, y: -4 },
+          spine: { x: 5, y: -12 },
+          chest: { x: 8, y: -20 },
+          head: { x: 10, y: -30 },
+          elbowF: { x: 14, y: -26 },
+          handF: { x: 18, y: -38 },
+          elbowB: { x: -6, y: -14 },
+          handB: { x: -12, y: -9 },
+          kneeF: { x: 11, y: 2 },
+          footF: { x: 14, y: 11 },
+          kneeB: { x: -5, y: 8 },
+          footB: { x: -8, y: 17 },
+          weaponAngle: -1.35,
+          weaponReach: base.weaponReach + 11,
+          sheathed: false,
+          smearAlpha: beatLocal < 15 ? 0.92 : 0.3,
+          smearSpan: 2.5,
+        };
+        return blendStrikeSwingPose(crouchCoil, launchPose, easeOutCubic(Math.min(1, beatLocal / 10)));
+      }
+
+      // 8. Act IV Aerial Sky-Chase Pose ('ult_sky_chase')
+      if (p === 'ult_sky_chase') {
+        const wave = Math.sin(frame * 0.25) * 3;
+        return {
+          ...base,
+          hip: { x: 2, y: -3 },
+          spine: { x: 6, y: -11 },
+          chest: { x: 10, y: -18 },
+          head: { x: 13, y: -27 },
+          elbowF: { x: 15, y: -22 + wave * 0.5 },
+          handF: { x: 23, y: -28 + wave },
+          elbowB: { x: -8, y: -15 },
+          handB: { x: -15, y: -19 },
+          kneeF: { x: 10, y: 1 },
+          footF: { x: 6, y: 9 },
+          kneeB: { x: -6, y: 5 },
+          footB: { x: -11, y: 14 },
+          weaponAngle: -0.95 + wave * 0.08,
+          weaponReach: base.weaponReach + 8,
+          sheathed: false,
+        };
+      }
+
+      // 9. Act IV Foreground 2.5D Climax Pose ('ult_sheathe_climax')
+      if (p === 'ult_sheathe_climax') {
+        if (weaponType === 'katana') {
+          return {
+            ...base,
+            hip: { x: 0, y: 0 },
+            spine: { x: 1, y: -8 },
+            chest: { x: 2, y: -15 },
+            head: { x: 4, y: -24.5 },
+            elbowF: { x: -5, y: -9 },
+            handF: { x: -6, y: -2 },
+            elbowB: { x: -8, y: -8 },
+            handB: { x: -7, y: -2 },
+            kneeF: { x: 7, y: 9 },
+            footF: { x: 11, y: 18 },
+            kneeB: { x: -7, y: 9 },
+            footB: { x: -11, y: 18 },
+            weaponAngle: 2.82,
+            weaponReach: base.weaponReach + 4,
+            sheathed: true,
+          };
+        }
+        const tremble = Math.sin(frame * 0.65) * 1.1;
+        return {
+          ...base,
+          hip: { x: -3 + tremble * 0.4, y: 1 },
           spine: { x: -4 + tremble, y: -7 },
           chest: { x: -5 + tremble, y: -14 },
           head: { x: -2 + tremble, y: -24 },
-          elbowF: { x: -7, y: -16 },
-          handF: { x: -13 + tremble, y: -22 },
-          elbowB: { x: -11, y: -13 },
-          handB: { x: -16 + tremble, y: -17 },
-          kneeF: { x: 9, y: 9 },
+          elbowF: { x: 10, y: -24 },
+          handF: { x: 16 + tremble, y: -35 },
+          elbowB: { x: -10, y: -18 },
+          handB: { x: -16 + tremble, y: -26 },
+          kneeF: { x: 9, y: 8 },
           footF: { x: 13, y: 18 },
           kneeB: { x: -9, y: 9 },
-          footB: { x: -14, y: 18 },
-          weaponAngle: weaponType === 'katana' ? 2.8 : -2.5,
-          weaponReach: base.weaponReach + 6,
-          sheathed: weaponType === 'katana',
-        };
-      } else {
-        // Cataclysm Strike Pose!
-        return {
-          ...base,
-          hip: { x: 6, y: 0 },
-          spine: { x: 10, y: -7 },
-          chest: { x: 14, y: -13 },
-          head: { x: 16, y: -22 },
-          elbowF: { x: 22, y: -12 },
-          handF: { x: 32, y: -9 },
-          elbowB: { x: -5, y: -11 },
-          handB: { x: -13, y: -8 },
-          kneeF: { x: 14, y: 8 },
-          footF: { x: 20, y: 18 },
-          kneeB: { x: -9, y: 10 },
-          footB: { x: -16, y: 18 },
-          weaponAngle: 0.08,
-          weaponReach: base.weaponReach + 11,
+          footB: { x: -13, y: 18 },
+          weaponAngle: -1.65,
+          weaponReach: base.weaponReach + 10,
           sheathed: false,
-          smearAlpha: frame <= 98 ? 0.9 : 0,
-          smearSpan: 2.2,
         };
       }
+
+      // 10. Act V Cataclysmic Finisher Dive ('ult_finisher_dive')
+      if (p === 'ult_finisher_dive') {
+        return {
+          ...base,
+          hip: { x: 4, y: -2 },
+          spine: { x: 9, y: -8 },
+          chest: { x: 15, y: -13 },
+          head: { x: 19, y: -20 },
+          elbowF: { x: 22, y: -9 },
+          handF: { x: 33, y: -3 },
+          elbowB: { x: -7, y: -15 },
+          handB: { x: -15, y: -20 },
+          kneeF: { x: 12, y: 4 },
+          footF: { x: 7, y: 12 },
+          kneeB: { x: -9, y: 3 },
+          footB: { x: -16, y: 10 },
+          weaponAngle: 0.45,
+          weaponReach: base.weaponReach + 12,
+          sheathed: false,
+          smearAlpha: 0.9,
+          smearSpan: 2.5,
+        };
+      }
+
+      // 11. Act V Full-Extension Cataclysmic Finisher Cleave ('ult_finisher_cleave')
+      if (weaponType === 'katana') {
+        return {
+          ...base,
+          hip: { x: 0, y: 0 },
+          spine: { x: 1, y: -8 },
+          chest: { x: 2, y: -15 },
+          head: { x: 4, y: -24.5 },
+          elbowF: { x: -6, y: -9 },
+          handF: { x: -7, y: -1 },
+          elbowB: { x: -8, y: -8 },
+          handB: { x: -7, y: -2 },
+          kneeF: { x: 7, y: 9 },
+          footF: { x: 11, y: 18 },
+          kneeB: { x: -7, y: 9 },
+          footB: { x: -11, y: 18 },
+          weaponAngle: 2.82,
+          weaponReach: base.weaponReach + 4,
+          sheathed: true,
+        };
+      }
+      return {
+        ...base,
+        hip: { x: 6, y: 0 },
+        spine: { x: 11, y: -7 },
+        chest: { x: 15, y: -13 },
+        head: { x: 18, y: -22 },
+        elbowF: { x: 23, y: -12 },
+        handF: { x: 34, y: -9 },
+        elbowB: { x: -6, y: -11 },
+        handB: { x: -14, y: -8 },
+        kneeF: { x: 15, y: 8 },
+        footF: { x: 21, y: 18 },
+        kneeB: { x: -10, y: 10 },
+        footB: { x: -17, y: 18 },
+        weaponAngle: 0.08,
+        weaponReach: base.weaponReach + 13,
+        sheathed: false,
+        smearAlpha: frame <= 405 ? 0.9 : 0,
+        smearSpan: 2.5,
+      };
     }
 
-    // 2. Detailed 3-Phase Attack Keyframe System (Windup -> Active Strike -> Follow-Through/Recovery)
+    // 2. Detailed 3-Phase Attack Keyframe System (Smooth Windup -> Curved Active Swing + Impact Hold -> Fluid Follow-Through)
     if (action === 'attack' && moveKey) {
-      const startup = move?.startup ?? 5;
-      const active = move?.active ?? 5;
-      const recovery = move?.recovery ?? 10;
+      const startup = move?.startup ?? 8;
+      const active = move?.active ?? 8;
+      const recovery = move?.recovery ?? 14;
 
       const inWindup = frame < startup;
       const inActive = frame >= startup && frame < startup + active;
-      const windupT = easeInOutQuad(frame / Math.max(1, startup));
-      const activeT = easeOutExpo((frame - startup) / Math.max(1, active));
-      const recovT = easeInOutQuad((frame - startup - active) / Math.max(1, recovery));
+      const windupT = easeInOutCubic(frame / Math.max(1, startup));
+      const activeProgress = clamp01((frame - startup) / Math.max(1, active));
+      const recovT = easeInOutCubic((frame - startup - active) / Math.max(1, recovery));
 
       const windupPose = this.getMoveWindupPose(base, moveKey, weaponType, grounded);
       const strikePose = this.getMoveStrikePose(base, moveKey, weaponType, grounded);
@@ -2063,16 +3749,23 @@ export class HDPixelRenderer {
       if (inWindup) {
         return blendPose(base, windupPose, windupT);
       } else if (inActive) {
-        const p = blendPose(windupPose, strikePose, activeT);
-        p.smearAlpha = 0.85 * (1 - activeT * 0.4);
+        // First 65% of active window swings along a curved martial-arts trajectory; final 35% holds the impact extension clearly!
+        const swingPhase = clamp01(activeProgress / 0.65);
+        const holdPhase = clamp01((activeProgress - 0.65) / 0.35);
+        let p = blendStrikeSwingPose(windupPose, strikePose, swingPhase);
+        if (holdPhase > 0) {
+          p = blendPose(p, followPose, holdPhase * 0.32);
+        }
+        p.smearAlpha = 0.85 * Math.sin(activeProgress * Math.PI);
         p.smearSpan = strikePose.smearSpan ?? 1.1;
         return p;
       } else {
-        const holdFollow = clamp01(recovT * 1.8);
-        if (recovT < 0.45) {
-          return blendPose(strikePose, followPose, holdFollow);
+        if (recovT < 0.38) {
+          const settleT = easeOutCubic(recovT / 0.38);
+          return blendPose(strikePose, followPose, settleT);
         }
-        return blendPose(followPose, base, (recovT - 0.45) / 0.55);
+        const returnT = easeInOutCubic((recovT - 0.38) / 0.62);
+        return blendPose(followPose, base, returnT);
       }
     }
 
@@ -2408,16 +4101,20 @@ export class HDPixelRenderer {
     if (moveKey === 'utilt' || moveKey === 'uair' || moveKey === 'ustrong' || moveKey === 'uspecial') {
       return {
         ...strike,
-        handF: { x: strike.handF.x - 4, y: strike.handF.y + 3 },
-        weaponAngle: strike.weaponAngle - 0.35,
+        chest: { x: strike.chest.x - 1, y: strike.chest.y - 1.5 },
+        handF: { x: strike.handF.x - 5.5, y: strike.handF.y + 3.5 },
+        weaponAngle: strike.weaponAngle - 0.44,
         smearAlpha: 0,
       };
     }
     return {
       ...strike,
-      chest: { x: strike.chest.x + 1.5, y: strike.chest.y + (grounded ? 1 : 0) },
-      handF: { x: strike.handF.x - 2, y: strike.handF.y + 3 },
-      weaponAngle: strike.weaponAngle + 0.38,
+      hip: { x: strike.hip.x + 1.2, y: strike.hip.y + (grounded ? 1.2 : 0) },
+      chest: { x: strike.chest.x + 2.2, y: strike.chest.y + (grounded ? 1.8 : 0.5) },
+      head: { x: strike.head.x + 2.0, y: strike.head.y + (grounded ? 1.5 : 0.5) },
+      elbowF: { x: strike.elbowF.x - 1.5, y: strike.elbowF.y + 2.5 },
+      handF: { x: strike.handF.x - 3.2, y: strike.handF.y + 4.5 },
+      weaponAngle: strike.weaponAngle + 0.48,
       smearAlpha: 0,
     };
   }
@@ -2425,314 +4122,485 @@ export class HDPixelRenderer {
   private drawCharacterHeadAndHair(
     ctx: CanvasRenderingContext2D,
     head: Vec2,
+    chest: Vec2,
     bodyColor: string,
     outlineColor: string,
     accentColor: string,
     secondaryColor: string,
     weaponType: WeaponType,
-    hasEyeTrail: boolean
+    hasEyeTrail: boolean,
+    vx = 0,
+    vy = 0
   ): void {
-    const hx = Math.round(head.x);
-    const hy = Math.round(head.y);
+    const hx = head.x;
+    const hy = head.y;
+    const isFlashOrImpact =
+      bodyColor === '#ffffff' || bodyColor === '#05070d' || bodyColor === '#f8fafc';
+    const darkInk = isFlashOrImpact ? outlineColor : '#04060c';
+    const windLagX = Math.max(-5.5, Math.min(4.5, -vx * 0.55));
+    const windLagY = Math.max(-4.0, Math.min(4.5, -vy * 0.4));
 
-    // 1. Back Hair / Crown / Hood Elements (behind head sphere)
+    // 0. Sculpted Neck & High Collar connecting Chest to Head
+    ctx.strokeStyle = darkInk;
+    ctx.lineWidth = weaponType === 'titan' ? 6.5 : 4.8;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(chest.x, chest.y - 1);
+    ctx.lineTo(hx - 0.5, hy + 3);
+    ctx.stroke();
+
+    ctx.strokeStyle = isFlashOrImpact
+      ? bodyColor
+      : weaponType === 'katana' || weaponType === 'spear' || weaponType === 'chains' || weaponType === 'orbs'
+      ? '#eab688'
+      : '#1e293b';
+    ctx.lineWidth = weaponType === 'titan' ? 3.8 : 2.6;
+    ctx.beginPath();
+    ctx.moveTo(chest.x, chest.y - 1);
+    ctx.lineTo(hx - 0.5, hy + 3);
+    ctx.stroke();
+
+    // 1. Multi-Lock Dynamic Back Hair / Ponytail / Flowing Mane (reacts to vx/vy!)
     if (weaponType === 'dagger') {
-      // KURO: Swept-back spiky shinobi hair & shadow cowl
-      ctx.fillStyle = outlineColor;
+      // KURO: Multi-Spike Midnight Shinobi Hair with Violet Rim Highlights
+      ctx.fillStyle = darkInk;
+      ctx.beginPath();
+      ctx.moveTo(hx - 1, hy - 6);
+      ctx.lineTo(hx - 15 + windLagX, hy - 11 + windLagY);
+      ctx.lineTo(hx - 9 + windLagX * 0.5, hy - 4);
+      ctx.lineTo(hx - 17 + windLagX, hy - 2 + windLagY);
+      ctx.lineTo(hx - 10 + windLagX * 0.5, hy + 2);
+      ctx.lineTo(hx - 14 + windLagX, hy + 5 + windLagY);
+      ctx.lineTo(hx - 4, hy + 3);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.fillStyle = isFlashOrImpact ? bodyColor : '#2e1065';
+      ctx.beginPath();
+      ctx.moveTo(hx - 2, hy - 5.5);
+      ctx.lineTo(hx - 13.5 + windLagX, hy - 9.8 + windLagY);
+      ctx.lineTo(hx - 8 + windLagX * 0.5, hy - 3.8);
+      ctx.lineTo(hx - 15 + windLagX, hy - 1.5 + windLagY);
+      ctx.lineTo(hx - 6, hy + 2.5);
+      ctx.closePath();
+      ctx.fill();
+
+      // Hair rim highlight
+      ctx.strokeStyle = accentColor;
+      ctx.lineWidth = 1.1;
       ctx.beginPath();
       ctx.moveTo(hx - 2, hy - 6);
-      ctx.lineTo(hx - 14, hy - 9);
-      ctx.lineTo(hx - 9, hy - 3);
-      ctx.lineTo(hx - 15, hy - 2);
-      ctx.lineTo(hx - 7, hy + 2);
-      ctx.closePath();
-      ctx.fill();
+      ctx.lineTo(hx - 13 + windLagX, hy - 9.5 + windLagY);
+      ctx.stroke();
     } else if (weaponType === 'gauntlet') {
-      // VELO: High-velocity lightning-bolt hair spikes streaming backward
-      ctx.fillStyle = secondaryColor;
+      // VELO: High-Velocity Golden-Cyan Aero Spikes Streaming Backward
+      ctx.fillStyle = darkInk;
       ctx.beginPath();
-      ctx.moveTo(hx, hy - 6);
-      ctx.lineTo(hx - 13, hy - 11);
-      ctx.lineTo(hx - 8, hy - 5);
-      ctx.lineTo(hx - 15, hy - 5);
-      ctx.lineTo(hx - 6, hy);
-      ctx.closePath();
-      ctx.fill();
-    } else if (weaponType === 'katana') {
-      // KENJI: Samurai topknot ponytail (chonmage) & fluttering crimson headband tails
-      ctx.fillStyle = '#0f172a';
-      ctx.beginPath();
-      ctx.moveTo(hx - 3, hy - 6);
-      ctx.lineTo(hx - 12, hy - 10);
-      ctx.lineTo(hx - 14, hy - 5);
-      ctx.lineTo(hx - 5, hy - 2);
-      ctx.closePath();
-      ctx.fill();
-    } else if (weaponType === 'spear') {
-      // RAIJIN: Wild crackling storm-god spiky mane
-      ctx.fillStyle = '#e0f2fe';
-      ctx.beginPath();
-      ctx.moveTo(hx + 2, hy - 6);
-      ctx.lineTo(hx - 6, hy - 14);
-      ctx.lineTo(hx - 4, hy - 8);
-      ctx.lineTo(hx - 14, hy - 11);
-      ctx.lineTo(hx - 8, hy - 4);
-      ctx.lineTo(hx - 15, hy - 2);
-      ctx.lineTo(hx - 5, hy + 2);
-      ctx.closePath();
-      ctx.fill();
-    } else if (weaponType === 'chains') {
-      // SOL: Blazing multi-layered Phoenix Flame Mane
-      ctx.fillStyle = accentColor;
-      ctx.beginPath();
-      ctx.moveTo(hx + 3, hy - 5);
-      ctx.lineTo(hx, hy - 15);
-      ctx.lineTo(hx - 3, hy - 8);
-      ctx.lineTo(hx - 11, hy - 14);
-      ctx.lineTo(hx - 7, hy - 5);
-      ctx.lineTo(hx - 14, hy - 6);
+      ctx.moveTo(hx + 1, hy - 6.5);
+      ctx.lineTo(hx - 15 + windLagX, hy - 13 + windLagY);
+      ctx.lineTo(hx - 8 + windLagX * 0.5, hy - 5.5);
+      ctx.lineTo(hx - 17 + windLagX, hy - 5 + windLagY);
+      ctx.lineTo(hx - 9 + windLagX * 0.5, hy - 1);
+      ctx.lineTo(hx - 14 + windLagX, hy + 3 + windLagY);
       ctx.lineTo(hx - 5, hy + 1);
       ctx.closePath();
       ctx.fill();
+
       ctx.fillStyle = secondaryColor;
       ctx.beginPath();
-      ctx.moveTo(hx + 1, hy - 5);
-      ctx.lineTo(hx - 2, hy - 12);
-      ctx.lineTo(hx - 8, hy - 9);
+      ctx.moveTo(hx, hy - 6);
+      ctx.lineTo(hx - 13.5 + windLagX, hy - 11.5 + windLagY);
+      ctx.lineTo(hx - 7.5 + windLagX * 0.5, hy - 5);
+      ctx.lineTo(hx - 15 + windLagX, hy - 4.5 + windLagY);
+      ctx.lineTo(hx - 6, hy + 0.5);
+      ctx.closePath();
+      ctx.fill();
+    } else if (weaponType === 'katana') {
+      // KENJI: Flowing Samurai Topknot Ponytail & Fluttering Crimson Hachimaki Tails
+      ctx.fillStyle = darkInk;
+      ctx.beginPath();
+      ctx.moveTo(hx - 3, hy - 5);
+      ctx.quadraticCurveTo(hx - 12, hy - 11, hx - 16 + windLagX, hy - 5 + windLagY);
+      ctx.quadraticCurveTo(hx - 11, hy - 1, hx - 5, hy - 1);
+      ctx.closePath();
+      ctx.fill();
+      // Crimson headband ribbon tails
+      ctx.strokeStyle = accentColor;
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.moveTo(hx - 5, hy - 2);
+      ctx.quadraticCurveTo(hx - 13, hy + 1, hx - 18 + windLagX * 1.2, hy + 4 + windLagY);
+      ctx.stroke();
+    } else if (weaponType === 'spear') {
+      // RAIJIN: Wild Crackling Silver-White Storm-God Mane
+      ctx.fillStyle = darkInk;
+      ctx.beginPath();
+      ctx.moveTo(hx + 3, hy - 6);
+      ctx.lineTo(hx - 6 + windLagX * 0.6, hy - 16 + windLagY);
+      ctx.lineTo(hx - 4, hy - 9);
+      ctx.lineTo(hx - 16 + windLagX, hy - 13 + windLagY);
+      ctx.lineTo(hx - 9, hy - 4);
+      ctx.lineTo(hx - 17 + windLagX, hy - 1 + windLagY);
+      ctx.lineTo(hx - 9, hy + 2);
+      ctx.lineTo(hx - 14 + windLagX, hy + 7 + windLagY);
+      ctx.lineTo(hx - 4, hy + 4);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.fillStyle = isFlashOrImpact ? bodyColor : '#e0f2fe';
+      ctx.beginPath();
+      ctx.moveTo(hx + 2, hy - 5.5);
+      ctx.lineTo(hx - 5.5 + windLagX * 0.6, hy - 14 + windLagY);
+      ctx.lineTo(hx - 3.5, hy - 8);
+      ctx.lineTo(hx - 14 + windLagX, hy - 11.5 + windLagY);
+      ctx.lineTo(hx - 8, hy - 3.5);
+      ctx.lineTo(hx - 15 + windLagX, hy - 1 + windLagY);
+      ctx.lineTo(hx - 5, hy + 2.5);
+      ctx.closePath();
+      ctx.fill();
+    } else if (weaponType === 'chains') {
+      // SOL: Multi-Layered Blazing Phoenix Flame Crown
+      ctx.fillStyle = darkInk;
+      ctx.beginPath();
+      ctx.moveTo(hx + 3.5, hy - 5);
+      ctx.lineTo(hx + windLagX * 0.4, hy - 17 + windLagY);
+      ctx.lineTo(hx - 3, hy - 9);
+      ctx.lineTo(hx - 12 + windLagX, hy - 16 + windLagY);
+      ctx.lineTo(hx - 7.5, hy - 5);
+      ctx.lineTo(hx - 16 + windLagX, hy - 6 + windLagY);
+      ctx.lineTo(hx - 5, hy + 2);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.fillStyle = accentColor;
+      ctx.beginPath();
+      ctx.moveTo(hx + 3, hy - 5);
+      ctx.lineTo(hx + windLagX * 0.4, hy - 15.5 + windLagY);
+      ctx.lineTo(hx - 3, hy - 8.5);
+      ctx.lineTo(hx - 11 + windLagX, hy - 14.5 + windLagY);
+      ctx.lineTo(hx - 7, hy - 5);
+      ctx.lineTo(hx - 14.5 + windLagX, hy - 5.5 + windLagY);
+      ctx.lineTo(hx - 5, hy + 1.5);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.fillStyle = secondaryColor;
+      ctx.beginPath();
+      ctx.moveTo(hx + 1.5, hy - 5);
+      ctx.lineTo(hx - 1.5 + windLagX * 0.3, hy - 12.5 + windLagY);
+      ctx.lineTo(hx - 8.5 + windLagX * 0.7, hy - 9.5 + windLagY);
       ctx.lineTo(hx - 4, hy - 3);
       ctx.closePath();
       ctx.fill();
     } else if (weaponType === 'orbs') {
-      // NYX: Long flowing cosmic empress hair cascading behind shoulders
-      ctx.fillStyle = outlineColor;
+      // NYX: Long Cascading Starlight Hair Tresses with Nebula Highlights
+      ctx.fillStyle = darkInk;
+      ctx.beginPath();
+      ctx.moveTo(hx - 1, hy - 6);
+      ctx.quadraticCurveTo(hx - 16 + windLagX, hy + 1, hx - 15 + windLagX * 1.3, hy + 17 + windLagY);
+      ctx.lineTo(hx - 7 + windLagX, hy + 14 + windLagY);
+      ctx.lineTo(hx - 3, hy + 6);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.fillStyle = isFlashOrImpact ? bodyColor : '#4a044e';
       ctx.beginPath();
       ctx.moveTo(hx - 2, hy - 5);
-      ctx.quadraticCurveTo(hx - 14, hy + 2, hx - 12, hy + 14);
-      ctx.lineTo(hx - 4, hy + 9);
+      ctx.quadraticCurveTo(hx - 14 + windLagX, hy + 1, hx - 13.5 + windLagX * 1.3, hy + 15.5 + windLagY);
+      ctx.lineTo(hx - 4, hy + 8);
       ctx.closePath();
       ctx.fill();
+
+      ctx.strokeStyle = accentColor;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(hx - 3, hy - 3);
+      ctx.quadraticCurveTo(hx - 11 + windLagX, hy + 3, hx - 11 + windLagX * 1.2, hy + 13 + windLagY);
+      ctx.stroke();
     }
 
-    // 2. Sculpted Head / Jaw Base Silhouette
-    const headR = weaponType === 'titan' ? 6.8 : 5.6;
-    ctx.fillStyle = outlineColor;
+    // 2. Sculpted Anime Head & Angled Jawline (No longer a flat circle!)
+    const headR = weaponType === 'titan' ? 6.8 : 5.7;
+    ctx.fillStyle = darkInk;
     ctx.beginPath();
-    ctx.arc(hx, hy, headR + 1.5, 0, Math.PI * 2);
+    ctx.arc(hx, hy - 0.5, headR + 1.4, Math.PI * 0.65, Math.PI * 2.15);
+    ctx.lineTo(hx + headR + 1.2, hy + 1.8);
+    ctx.lineTo(hx + 2.2, hy + headR + 1.4); // Sculpted anime chin point!
+    ctx.lineTo(hx - headR * 0.85, hy + headR * 0.75);
+    ctx.closePath();
     ctx.fill();
 
-    ctx.fillStyle = bodyColor;
+    // Base Cranium / Helmet Fill
+    const isHumanFace =
+      weaponType === 'katana' ||
+      weaponType === 'spear' ||
+      weaponType === 'chains' ||
+      weaponType === 'orbs' ||
+      weaponType === 'gauntlet';
+    ctx.fillStyle = isFlashOrImpact
+      ? bodyColor
+      : weaponType === 'titan'
+      ? '#132a23'
+      : weaponType === 'scythe'
+      ? '#0f1f26'
+      : '#1e293b';
     ctx.beginPath();
-    ctx.arc(hx, hy, headR, 0, Math.PI * 2);
+    ctx.arc(hx, hy - 0.5, headR, 0, Math.PI * 2);
     ctx.fill();
 
-    // 3. Character-Specific Headgear, Masks, Horns, Hats & Visors
+    // Cel-Shaded Anime Face / Jaw Plane for Exposed Faces
+    if (isHumanFace && !isFlashOrImpact) {
+      ctx.fillStyle = '#fde68a';
+      ctx.beginPath();
+      ctx.moveTo(hx - 1.5, hy - 3.5);
+      ctx.lineTo(hx + headR - 0.2, hy - 2.5);
+      ctx.lineTo(hx + headR - 0.4, hy + 1.8);
+      ctx.lineTo(hx + 2.0, hy + headR - 0.2); // Chin
+      ctx.lineTo(hx - 2.2, hy + 3.5);
+      ctx.closePath();
+      ctx.fill();
+
+      // Warm cheek/jaw cel shadow
+      ctx.fillStyle = '#f59e0b';
+      ctx.globalAlpha = 0.28;
+      ctx.beginPath();
+      ctx.moveTo(hx - 2.2, hy + 1.5);
+      ctx.lineTo(hx + 2.0, hy + headR - 0.2);
+      ctx.lineTo(hx - 2.2, hy + 3.5);
+      ctx.closePath();
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // 3. Character-Specific Headgear, Masks, Horns, Hats, Visors & Expressive Eyes
     if (weaponType === 'dagger') {
-      // KURO: High Shinobi Face-Mask covering lower face + Slanted Violet Assassin Eye + Forehead Protector
+      // KURO: Armored Shinobi Half-Mask with Metallic Nose Bridge + Forehead Plate + Slanted Violet Eye
       ctx.fillStyle = '#1e1b4b';
       ctx.beginPath();
-      ctx.moveTo(hx - 5, hy);
-      ctx.lineTo(hx + 6, hy - 0.5);
-      ctx.lineTo(hx + 4.5, hy + 5.5);
-      ctx.lineTo(hx - 4, hy + 5);
+      ctx.moveTo(hx - 5.2, hy - 0.2);
+      ctx.lineTo(hx + 6.2, hy - 0.6);
+      ctx.lineTo(hx + 4.2, hy + 5.8);
+      ctx.lineTo(hx - 4.2, hy + 5.0);
       ctx.closePath();
       ctx.fill();
-      // Forehead shinobi band
+      ctx.strokeStyle = accentColor;
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      ctx.moveTo(hx - 4.5, hy + 0.2);
+      ctx.lineTo(hx + 5.8, hy - 0.2);
+      ctx.stroke();
+
+      // Forehead protector band with metallic shinobi plate
       ctx.fillStyle = accentColor;
-      ctx.fillRect(hx - 5, hy - 4.5, 10.5, 1.8);
-      // Sharp slanted eye & vertical scar
+      ctx.fillRect(hx - 5.5, hy - 4.8, 11.2, 2.0);
+      ctx.fillStyle = '#e2e8f0';
+      ctx.fillRect(hx + 0.5, hy - 4.6, 4.2, 1.5);
+
+      // Slanted assassin eye with glowing iris & white specular glint
       ctx.fillStyle = secondaryColor;
       ctx.beginPath();
-      ctx.moveTo(hx + 0.5, hy - 1.5);
-      ctx.lineTo(hx + 5.5, hy - 2.8);
-      ctx.lineTo(hx + 5, hy - 0.5);
+      ctx.moveTo(hx + 0.5, hy - 1.6);
+      ctx.lineTo(hx + 5.8, hy - 3.0);
+      ctx.lineTo(hx + 5.2, hy - 0.5);
       ctx.closePath();
       ctx.fill();
       ctx.fillStyle = '#ffffff';
-      ctx.fillRect(hx + 3, hy - 2.2, 1.5, 1.5);
+      ctx.fillRect(hx + 3.2, hy - 2.3, 1.6, 1.5);
     } else if (weaponType === 'gauntlet') {
-      // VELO: Wrap-around Speedster Cyber-Visor Goggles + Winged Ear Piece
-      ctx.fillStyle = '#0f172a';
-      ctx.fillRect(hx - 4, hy - 3.5, 10.5, 4.2);
+      // VELO: Wrap-Around Aerodynamic Cyber-Visor Goggles + Winged Comms Fin
+      ctx.fillStyle = '#090d16';
+      ctx.fillRect(hx - 4.5, hy - 3.8, 11.2, 4.4);
       ctx.fillStyle = secondaryColor;
       ctx.beginPath();
-      ctx.moveTo(hx - 1, hy - 3);
-      ctx.lineTo(hx + 6.5, hy - 3.5);
-      ctx.lineTo(hx + 5.5, hy);
-      ctx.lineTo(hx - 1, hy - 0.5);
+      ctx.moveTo(hx - 1.2, hy - 3.2);
+      ctx.lineTo(hx + 6.8, hy - 3.6);
+      ctx.lineTo(hx + 5.8, hy + 0.2);
+      ctx.lineTo(hx - 1.2, hy - 0.4);
       ctx.closePath();
       ctx.fill();
       ctx.fillStyle = '#ffffff';
-      ctx.fillRect(hx + 2.5, hy - 2.8, 2.5, 1.2);
-      // Side speed-wing antenna
+      ctx.fillRect(hx + 2.5, hy - 3.0, 2.8, 1.3);
+      // Side speed-wing antenna fin
       ctx.fillStyle = accentColor;
       ctx.beginPath();
-      ctx.moveTo(hx - 1, hy - 1);
-      ctx.lineTo(hx - 8, hy - 4);
-      ctx.lineTo(hx - 5, hy + 0.5);
+      ctx.moveTo(hx - 0.5, hy - 1);
+      ctx.lineTo(hx - 8.5, hy - 4.5);
+      ctx.lineTo(hx - 5, hy + 0.8);
       ctx.closePath();
       ctx.fill();
     } else if (weaponType === 'katana') {
-      // KENJI: Iconic Wide Woven Ronin Bamboo Kasa (Conical Samurai Straw Hat) + Blazing Eye underneath!
-      // Glowing eye under shadow of the hat
+      // KENJI: Fierce Samurai Eye + Woven Bamboo Ronin Kasa (Conical Hat) with Ribbed Texture!
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(hx + 1.0, hy - 2.2, 4.8, 1.0); // Fierce eyebrow
       ctx.fillStyle = secondaryColor;
-      ctx.fillRect(hx + 1.5, hy - 1.5, 4.2, 2.0);
+      ctx.fillRect(hx + 1.5, hy - 1.4, 4.4, 2.0);
       ctx.fillStyle = '#ffffff';
-      ctx.fillRect(hx + 3.2, hy - 1.5, 1.5, 1.5);
-      // Conical Ronin Hat (Kasa) tilted forward
+      ctx.fillRect(hx + 3.4, hy - 1.4, 1.6, 1.5);
+
       ctx.save();
-      ctx.translate(hx + 0.5, hy - 4.2);
-      ctx.rotate(0.12);
+      ctx.translate(hx + 0.5, hy - 4.4);
+      ctx.rotate(0.11);
       // Dark under-brim shadow
-      ctx.fillStyle = '#05070d';
+      ctx.fillStyle = '#04060c';
       ctx.beginPath();
-      ctx.ellipse(0, 1, 13.5, 2.6, 0, 0, Math.PI * 2);
+      ctx.ellipse(0, 1.2, 14.5, 2.8, 0, 0, Math.PI * 2);
       ctx.fill();
-      // Conical hat roof
+      // Conical hat body
       ctx.fillStyle = '#1e293b';
       ctx.beginPath();
-      ctx.moveTo(-13.5, 0.5);
-      ctx.lineTo(0, -6.5);
-      ctx.lineTo(13.5, 0.5);
+      ctx.moveTo(-14.5, 0.6);
+      ctx.lineTo(0, -7.2);
+      ctx.lineTo(14.5, 0.6);
       ctx.closePath();
       ctx.fill();
-      // Crimson bamboo rim & gold apex ornament
-      ctx.strokeStyle = accentColor;
-      ctx.lineWidth = 1.6;
+      // Lit top slope & bamboo ribs
+      ctx.fillStyle = '#334155';
       ctx.beginPath();
-      ctx.moveTo(-13, 0.5);
-      ctx.lineTo(13, 0.5);
+      ctx.moveTo(0, -7.2);
+      ctx.lineTo(14.2, 0.6);
+      ctx.lineTo(1.5, 0.6);
+      ctx.closePath();
+      ctx.fill();
+      // Crimson rim & golden kasa finial
+      ctx.strokeStyle = accentColor;
+      ctx.lineWidth = 1.7;
+      ctx.beginPath();
+      ctx.moveTo(-14, 0.6);
+      ctx.lineTo(14, 0.6);
       ctx.stroke();
       ctx.fillStyle = secondaryColor;
-      ctx.fillRect(-2, -6.5, 4, 2);
+      ctx.fillRect(-2.2, -7.2, 4.4, 2.2);
       ctx.restore();
     } else if (weaponType === 'titan') {
-      // BRAM: Horned Juggernaut Titan Helm + Heavy Jawplate + Glowing T-Visor
-      // Metallic jawplate
-      ctx.fillStyle = '#1e293b';
-      ctx.fillRect(hx - 5, hy, 11, 6);
+      // BRAM: Segmented Juggernaut Great-Helm + Mandible Jawplate + Blazing T-Visor + Bull Horns
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(hx - 5.5, hy - 0.2, 12, 6.5);
       ctx.fillStyle = accentColor;
-      ctx.fillRect(hx - 4, hy + 1.5, 9.5, 3);
-      // Blazing emerald/gold visor slit
+      ctx.fillRect(hx - 4.2, hy + 1.4, 10, 3.4);
+      // Rivet studs on jawplate
       ctx.fillStyle = secondaryColor;
-      ctx.fillRect(hx + 0.5, hy - 2.5, 5.8, 2.4);
+      ctx.fillRect(hx - 3, hy + 2.4, 1.5, 1.5);
+      ctx.fillRect(hx + 2.5, hy + 2.4, 1.5, 1.5);
+      // Blazing T-Visor slit
+      ctx.fillStyle = secondaryColor;
+      ctx.fillRect(hx + 0.5, hy - 2.6, 6.2, 2.5);
       ctx.fillStyle = '#ffffff';
-      ctx.fillRect(hx + 3, hy - 2.2, 2, 1.5);
-      // Twin Curved Titan Bull Horns sweeping upward & forward!
-      ctx.strokeStyle = '#05070d';
-      ctx.lineWidth = 4.2;
+      ctx.fillRect(hx + 3.2, hy - 2.3, 2.2, 1.6);
+      // Twin Curved Titan Bull Horns
+      ctx.strokeStyle = darkInk;
+      ctx.lineWidth = 4.6;
       ctx.beginPath();
       ctx.moveTo(hx - 2, hy - 4);
-      ctx.quadraticCurveTo(hx - 8, hy - 12, hx + 3, hy - 14);
+      ctx.quadraticCurveTo(hx - 9, hy - 12.5, hx + 3.5, hy - 14.5);
       ctx.stroke();
       ctx.strokeStyle = secondaryColor;
-      ctx.lineWidth = 2.2;
+      ctx.lineWidth = 2.4;
       ctx.beginPath();
       ctx.moveTo(hx - 2, hy - 4);
-      ctx.quadraticCurveTo(hx - 8, hy - 12, hx + 3, hy - 14);
+      ctx.quadraticCurveTo(hx - 9, hy - 12.5, hx + 3.5, hy - 14.5);
       ctx.stroke();
     } else if (weaponType === 'spear') {
-      // RAIJIN: Storm-God Oni Diadem with Tall Central Lightning Horn
+      // RAIJIN: Storm-God Golden Oni Diadem + Tall Jagged Lightning Horn + Crackling Eyes
       ctx.fillStyle = secondaryColor;
-      ctx.fillRect(hx - 5, hy - 4.2, 10.5, 1.8);
-      // Tall jagged golden lightning horn on brow
+      ctx.fillRect(hx - 5.2, hy - 4.5, 11, 2.0);
       ctx.beginPath();
-      ctx.moveTo(hx + 2, hy - 4);
-      ctx.lineTo(hx + 8, hy - 13);
-      ctx.lineTo(hx + 4.5, hy - 3.5);
+      ctx.moveTo(hx + 1.8, hy - 4.2);
+      ctx.lineTo(hx + 8.5, hy - 14);
+      ctx.lineTo(hx + 4.8, hy - 3.6);
       ctx.closePath();
       ctx.fill();
-      // Crackling electric eye
       ctx.fillStyle = accentColor;
-      ctx.fillRect(hx + 1.5, hy - 2, 4.2, 2.2);
+      ctx.fillRect(hx + 1.5, hy - 2.0, 4.4, 2.2);
       ctx.fillStyle = '#ffffff';
-      ctx.fillRect(hx + 3.2, hy - 2, 1.6, 1.6);
+      ctx.fillRect(hx + 3.2, hy - 2.0, 1.8, 1.6);
     } else if (weaponType === 'scythe') {
-      // CHRONO: Pointed Gothic Reaper Hood + Floating Golden Sundial Crest + Clockwork Monocle Eye
+      // CHRONO: Aristocratic Pointed Reaper Cowl + Floating Sundial Crown + Golden Monocle
       ctx.fillStyle = '#09151b';
       ctx.beginPath();
-      ctx.moveTo(hx - 9, hy - 10);
-      ctx.lineTo(hx + 6.5, hy - 4.5);
-      ctx.lineTo(hx + 5, hy + 5);
-      ctx.lineTo(hx - 6.5, hy + 4);
+      ctx.moveTo(hx - 9.5, hy - 10.5);
+      ctx.lineTo(hx + 7, hy - 4.8);
+      ctx.lineTo(hx + 5.2, hy + 5.2);
+      ctx.lineTo(hx - 6.8, hy + 4.2);
       ctx.closePath();
       ctx.fill();
       ctx.strokeStyle = secondaryColor;
       ctx.lineWidth = 1.5;
       ctx.stroke();
-      // Floating Golden Crown/Sundial Crest above hood
+      // Floating Golden Sundial Crown above hood
       ctx.fillStyle = secondaryColor;
       ctx.beginPath();
-      ctx.moveTo(hx, hy - 13);
-      ctx.lineTo(hx + 3, hy - 8.5);
-      ctx.lineTo(hx - 3, hy - 8.5);
+      ctx.moveTo(hx, hy - 13.5);
+      ctx.lineTo(hx + 3.4, hy - 8.5);
+      ctx.lineTo(hx - 3.4, hy - 8.5);
       ctx.closePath();
       ctx.fill();
       // Glowing Clockwork Monocle Eye
       ctx.strokeStyle = secondaryColor;
-      ctx.lineWidth = 1.3;
+      ctx.lineWidth = 1.4;
       ctx.beginPath();
-      ctx.arc(hx + 2.8, hy - 1.2, 2.6, 0, Math.PI * 2);
+      ctx.arc(hx + 2.8, hy - 1.2, 2.7, 0, Math.PI * 2);
       ctx.stroke();
       ctx.fillStyle = accentColor;
-      ctx.fillRect(hx + 2, hy - 2, 2, 2);
+      ctx.fillRect(hx + 2, hy - 2, 2.1, 2.1);
     } else if (weaponType === 'chains') {
-      // SOL: Fierce Phoenix-Beak Brow Guard + Blazing Solar Eyes
+      // SOL: Winged Phoenix Brow Circlet + Fierce Blazing Solar Eyes
       ctx.fillStyle = secondaryColor;
       ctx.beginPath();
-      ctx.moveTo(hx - 4, hy - 4);
-      ctx.lineTo(hx + 7, hy - 2.5);
-      ctx.lineTo(hx + 3, hy - 0.5);
+      ctx.moveTo(hx - 4.5, hy - 4.2);
+      ctx.lineTo(hx + 7.5, hy - 2.6);
+      ctx.lineTo(hx + 3.2, hy - 0.4);
       ctx.closePath();
       ctx.fill();
       ctx.fillStyle = '#ffffff';
-      ctx.fillRect(hx + 2, hy - 2.2, 3.5, 2);
+      ctx.fillRect(hx + 2.0, hy - 2.2, 3.8, 2.0);
     } else if (weaponType === 'orbs') {
-      // NYX: Twin Crescent-Moon Empress Horns + Floating Diamond Third-Eye Crown
+      // NYX: Twin Crescent-Moon Empress Horns + Forehead Star Diamond + Luminous Eyes
       ctx.strokeStyle = secondaryColor;
-      ctx.lineWidth = 1.8;
+      ctx.lineWidth = 2.0;
       ctx.beginPath();
       ctx.moveTo(hx - 2, hy - 5);
-      ctx.quadraticCurveTo(hx - 6, hy - 12, hx - 1, hy - 14);
+      ctx.quadraticCurveTo(hx - 6.5, hy - 12.5, hx - 1, hy - 14.5);
       ctx.moveTo(hx + 2, hy - 5);
-      ctx.quadraticCurveTo(hx + 6, hy - 12, hx + 2, hy - 14);
+      ctx.quadraticCurveTo(hx + 6.5, hy - 12.5, hx + 2.2, hy - 14.5);
       ctx.stroke();
-      // Glowing third-eye star diamond on forehead
       ctx.fillStyle = '#ffffff';
-      ctx.fillRect(hx + 2, hy - 5.5, 2.2, 2.2);
-      // Luminous astral eye
+      ctx.fillRect(hx + 2, hy - 5.6, 2.4, 2.4);
       ctx.fillStyle = accentColor;
-      ctx.fillRect(hx + 1.5, hy - 2, 4, 2.2);
-      ctx.fillStyle = secondaryColor;
-      ctx.fillRect(hx + 3, hy - 2, 1.8, 1.8);
+      ctx.fillRect(hx + 1.5, hy - 2, 4.2, 2.2);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(hx + 3.2, hy - 2, 1.8, 1.8);
     } else if (weaponType === 'claws') {
-      // JIN: Cyber-Kitsune / Oni Mask with Pointed Ears & Triple-Slit Teal Visor
+      // JIN: Sculpted Cyber-Kitsune Mask with Pointed Ears, Jaw Collar & Triple-Slit Teal Visor
       ctx.fillStyle = '#1e1b4b';
       ctx.beginPath();
-      ctx.moveTo(hx - 3, hy - 6);
-      ctx.lineTo(hx - 6, hy - 12);
+      ctx.moveTo(hx - 3.5, hy - 6);
+      ctx.lineTo(hx - 6.5, hy - 12.8);
       ctx.lineTo(hx + 1, hy - 6);
-      ctx.lineTo(hx + 4, hy - 12);
-      ctx.lineTo(hx + 5.5, hy - 4);
+      ctx.lineTo(hx + 4.5, hy - 12.8);
+      ctx.lineTo(hx + 5.8, hy - 4);
       ctx.closePath();
       ctx.fill();
-      // High collar covering jaw
+      ctx.strokeStyle = secondaryColor;
+      ctx.lineWidth = 1.1;
+      ctx.stroke();
+      // High armoured collar covering jaw
       ctx.fillStyle = '#0f172a';
-      ctx.fillRect(hx - 5, hy + 0.5, 10.5, 5);
+      ctx.fillRect(hx - 5.2, hy + 0.4, 11, 5.2);
       ctx.strokeStyle = accentColor;
       ctx.lineWidth = 1.2;
-      ctx.strokeRect(hx - 5, hy + 0.5, 10.5, 5);
+      ctx.strokeRect(hx - 5.2, hy + 0.4, 11, 5.2);
       // Triple-slit glowing cyber visor
       ctx.fillStyle = secondaryColor;
-      ctx.fillRect(hx + 1, hy - 3, 4.8, 1.3);
-      ctx.fillRect(hx + 1.8, hy - 1, 4.0, 1.3);
+      ctx.fillRect(hx + 1, hy - 3.1, 5.0, 1.3);
+      ctx.fillRect(hx + 1.8, hy - 1.1, 4.2, 1.3);
     }
 
     if (hasEyeTrail) {
       ctx.strokeStyle = secondaryColor;
-      ctx.lineWidth = 1.9;
+      ctx.lineWidth = 2.0;
       ctx.beginPath();
-      ctx.moveTo(hx + 2, hy - 1.5);
-      ctx.lineTo(hx - 15, hy - 3.5);
+      ctx.moveTo(hx + 2.5, hy - 1.5);
+      ctx.lineTo(hx - 16 + windLagX, hy - 3.5 + windLagY);
       ctx.stroke();
     }
   }
@@ -2746,15 +4614,113 @@ export class HDPixelRenderer {
     secondaryColor: string,
     weaponType: WeaponType,
     limbW: number,
-    outlineW: number
+    outlineW: number,
+    vx = 0,
+    vy = 0
   ): void {
-    const strokeTaperedSegment = (
+    const isFlashOrImpact =
+      bodyColor === '#ffffff' || bodyColor === '#05070d' || bodyColor === '#f8fafc';
+    const darkInk = isFlashOrImpact ? outlineColor : '#04060c';
+
+    // Rich 3-Tone Cel-Shaded Costume Palette per Character (never blends into dark background!)
+    let clothBase = '#1e293b';
+    let clothLight = '#334155';
+    let clothDeep = '#0f172a';
+    let pantsColor = '#111827';
+    let bootColor = '#1e293b';
+    let skinOrSleeve = '#1e293b';
+
+    if (isFlashOrImpact) {
+      clothBase = bodyColor;
+      clothLight = bodyColor;
+      clothDeep = bodyColor;
+      pantsColor = bodyColor;
+      bootColor = bodyColor;
+      skinOrSleeve = bodyColor;
+    } else if (weaponType === 'dagger') {
+      // KURO: Midnight Violet Shinobi Flak Armor & Shadow Wraps
+      clothBase = '#2e1065';
+      clothLight = '#4c1d95';
+      clothDeep = '#170936';
+      pantsColor = '#1e1b4b';
+      bootColor = '#312e81';
+      skinOrSleeve = '#1e1b4b';
+    } else if (weaponType === 'gauntlet') {
+      // VELO: Deep Cobalt-Cyan Sprinter Jacket & White-Trim Track Greaves
+      clothBase = '#0c4a6e';
+      clothLight = '#0284c7';
+      clothDeep = '#082f49';
+      pantsColor = '#0f172a';
+      bootColor = '#0369a1';
+      skinOrSleeve = '#0284c7';
+    } else if (weaponType === 'katana') {
+      // KENJI: Crimson-Trimmed Ronin Haori over Slate Gi & Wide Indigo Hakama
+      clothBase = '#1e293b';
+      clothLight = '#334155';
+      clothDeep = '#0f172a';
+      pantsColor = '#172554';
+      bootColor = '#f8fafc'; // White Samurai Tabi & Waraji
+      skinOrSleeve = '#1e293b';
+    } else if (weaponType === 'titan') {
+      // BRAM: Heavy Emerald-Obsidian Juggernaut Plate Armor
+      clothBase = '#064e3b';
+      clothLight = '#047857';
+      clothDeep = '#022c22';
+      pantsColor = '#0f2922';
+      bootColor = '#065f46';
+      skinOrSleeve = '#064e3b';
+    } else if (weaponType === 'spear') {
+      // RAIJIN: Royal Storm-Blue Martial Gi & Muscular Arms with Golden Bracers
+      clothBase = '#1e3a8a';
+      clothLight = '#2563eb';
+      clothDeep = '#172554';
+      pantsColor = '#0f172a';
+      bootColor = '#1d4ed8';
+      skinOrSleeve = '#eab688'; // Muscular martial-artist arms
+    } else if (weaponType === 'scythe') {
+      // CHRONO: Aristocratic Abyssal-Teal Tailcoat & Brass Clockwork Trim
+      clothBase = '#134e4a';
+      clothLight = '#0f766e';
+      clothDeep = '#042f2e';
+      pantsColor = '#09191f';
+      bootColor = '#115e59';
+      skinOrSleeve = '#134e4a';
+    } else if (weaponType === 'chains') {
+      // SOL: Ashen-Phoenix Open-Chest Flame Gi, Muscular Torso & Molten Wraps
+      clothBase = '#7c2d12';
+      clothLight = '#c2410c';
+      clothDeep = '#431407';
+      pantsColor = '#1c1917';
+      bootColor = '#9a3412';
+      skinOrSleeve = '#eab688'; // Muscular pyromancer arms
+    } else if (weaponType === 'orbs') {
+      // NYX: Regal Astral-Magenta Armored Bodice & Cosmic Gown
+      clothBase = '#701a75';
+      clothLight = '#a21caf';
+      clothDeep = '#4a044e';
+      pantsColor = '#2e1065';
+      bootColor = '#86198f';
+      skinOrSleeve = '#701a75';
+    } else if (weaponType === 'claws') {
+      // JIN: Cyber-Indigo Puppeteer Trenchcoat & Neon Circuit Seams
+      clothBase = '#1e1b4b';
+      clothLight = '#3730a3';
+      clothDeep = '#0f172a';
+      pantsColor = '#0f172a';
+      bootColor = '#312e81';
+      skinOrSleeve = '#1e1b4b';
+    }
+
+    // Helper: Draw a 3-Tone Cel-Shaded Anatomical Limb Segment (Dark Ink Border + Base + Directional Rim Highlight)
+    const drawCelLimb = (
       a: Vec2,
       b: Vec2,
       wStart: number,
       wEnd: number,
       fillCol: string,
-      outCol: string
+      litCol: string,
+      rimCol: string,
+      isFront: boolean
     ) => {
       const dx = b.x - a.x;
       const dy = b.y - a.y;
@@ -2762,10 +4728,10 @@ export class HDPixelRenderer {
       const nx = -dy / len;
       const ny = dx / len;
 
-      // Outer outline polygon
-      const ow1 = wStart * 0.5 + 1.3;
-      const ow2 = wEnd * 0.5 + 1.3;
-      ctx.fillStyle = outCol;
+      // 1) Crisp Dark Ink Outer Silhouette
+      const ow1 = wStart * 0.5 + 1.4;
+      const ow2 = wEnd * 0.5 + 1.4;
+      ctx.fillStyle = darkInk;
       ctx.beginPath();
       ctx.moveTo(a.x + nx * ow1, a.y + ny * ow1);
       ctx.lineTo(b.x + nx * ow2, b.y + ny * ow2);
@@ -2774,7 +4740,7 @@ export class HDPixelRenderer {
       ctx.closePath();
       ctx.fill();
 
-      // Inner fill polygon
+      // 2) Main Garment / Muscle Fill
       const iw1 = wStart * 0.5;
       const iw2 = wEnd * 0.5;
       ctx.fillStyle = fillCol;
@@ -2785,181 +4751,477 @@ export class HDPixelRenderer {
       ctx.lineTo(a.x - nx * iw1, a.y - ny * iw1);
       ctx.closePath();
       ctx.fill();
+
+      // 3) Cel-Shaded Lit Half-Plane on Front Edge
+      if (!isFlashOrImpact && isFront) {
+        ctx.fillStyle = litCol;
+        ctx.beginPath();
+        ctx.moveTo(a.x + nx * iw1, a.y + ny * iw1);
+        ctx.lineTo(b.x + nx * iw2, b.y + ny * iw2);
+        ctx.lineTo(b.x, b.y);
+        ctx.lineTo(a.x, a.y);
+        ctx.closePath();
+        ctx.fill();
+
+        // Crisp colored rim-light line along leading edge
+        ctx.strokeStyle = rimCol;
+        ctx.lineWidth = 0.95;
+        ctx.beginPath();
+        ctx.moveTo(a.x + nx * iw1, a.y + ny * iw1);
+        ctx.lineTo(b.x + nx * iw2, b.y + ny * iw2);
+        ctx.stroke();
+      }
     };
 
-    // 1. Back Coat-Tails / Capes / Skirts (behind legs & torso)
-    if (weaponType === 'scythe') {
-      // CHRONO: Sweeping Gothic Reaper Trenchcoat tails behind legs
-      ctx.fillStyle = '#071318';
-      ctx.strokeStyle = secondaryColor;
-      ctx.lineWidth = 1.4;
+    // Helper: Draw Articulated Combat Boot / Greave Shoe / Samurai Tabi at Foot Joint
+    const drawCombatBoot = (knee: Vec2, foot: Vec2, isFront: boolean) => {
+      const shinAng = Math.atan2(foot.y - knee.y, foot.x - knee.x);
+      const bootAng = Math.max(-0.55, Math.min(0.65, shinAng - Math.PI * 0.5)) * 0.5;
+      ctx.save();
+      ctx.translate(foot.x, foot.y);
+      ctx.rotate(bootAng);
+
+      // Boot silhouette border
+      ctx.fillStyle = darkInk;
       ctx.beginPath();
-      ctx.moveTo(pose.spine.x - 3, pose.spine.y);
-      ctx.lineTo(pose.hip.x - 15, pose.hip.y + 14);
-      ctx.lineTo(pose.hip.x - 4, pose.hip.y + 11);
-      ctx.lineTo(pose.hip.x + 2, pose.hip.y + 14);
+      ctx.moveTo(-3.6, -3.2);
+      ctx.lineTo(3.2, -2.5);
+      ctx.lineTo(7.2, 0.8);
+      ctx.lineTo(6.8, 2.8);
+      ctx.lineTo(-3.8, 2.8);
+      ctx.closePath();
+      ctx.fill();
+
+      // Boot upper body
+      ctx.fillStyle = isFront ? bootColor : clothDeep;
+      ctx.beginPath();
+      ctx.moveTo(-2.6, -2.2);
+      ctx.lineTo(2.4, -1.6);
+      ctx.lineTo(6.0, 0.8);
+      ctx.lineTo(5.6, 1.8);
+      ctx.lineTo(-2.8, 1.8);
+      ctx.closePath();
+      ctx.fill();
+
+      // Sole & ankle cuff highlight
+      if (!isFlashOrImpact) {
+        ctx.fillStyle = isFront ? secondaryColor : accentColor;
+        ctx.fillRect(-2.6, 1.2, 8.2, 1.0);
+        if (weaponType === 'katana') {
+          // Red Waraji sandal strap over white Tabi
+          ctx.fillStyle = accentColor;
+          ctx.fillRect(0.5, -1.2, 1.8, 2.4);
+        }
+      }
+      ctx.restore();
+    };
+
+    // Helper: Draw Sculpted Martial Fist / Armored Glove at Hand Joint
+    const drawGlovedFist = (elbow: Vec2, hand: Vec2, isFront: boolean) => {
+      const armAng = Math.atan2(hand.y - elbow.y, hand.x - elbow.x);
+      ctx.save();
+      ctx.translate(hand.x, hand.y);
+      ctx.rotate(armAng);
+      const r = weaponType === 'titan' ? 3.8 : 2.7;
+
+      ctx.fillStyle = darkInk;
+      ctx.beginPath();
+      ctx.arc(0, 0, r + 1.2, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = isFlashOrImpact
+        ? bodyColor
+        : isFront
+        ? accentColor
+        : clothLight;
+      ctx.beginPath();
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
+      ctx.fill();
+
+      if (!isFlashOrImpact && isFront) {
+        ctx.fillStyle = secondaryColor;
+        ctx.fillRect(0.2, -r * 0.6, r * 0.7, r * 1.2);
+      }
+      ctx.restore();
+    };
+
+    const windCoatX = Math.max(-7, Math.min(5, -vx * 0.75));
+    const windCoatY = Math.max(-5, Math.min(5, -vy * 0.45));
+
+    // =========================================================================
+    // 1. VELOCITY-REACTIVE BACK COAT-TAILS / HAORI / CAPE (behind legs & torso)
+    // =========================================================================
+    if (
+      weaponType === 'scythe' ||
+      weaponType === 'dagger' ||
+      weaponType === 'orbs' ||
+      weaponType === 'claws' ||
+      weaponType === 'katana' ||
+      weaponType === 'spear'
+    ) {
+      ctx.fillStyle = darkInk;
+      ctx.beginPath();
+      ctx.moveTo(pose.spine.x - 2, pose.spine.y - 2);
+      ctx.quadraticCurveTo(
+        pose.hip.x - 12 + windCoatX * 0.6,
+        pose.hip.y + 5,
+        pose.hip.x - 16 + windCoatX,
+        pose.hip.y + 15 + windCoatY
+      );
+      ctx.lineTo(pose.hip.x - 5 + windCoatX * 0.6, pose.hip.y + 12 + windCoatY * 0.6);
+      ctx.lineTo(pose.hip.x + 2, pose.hip.y + 14 + windCoatY * 0.4);
       ctx.lineTo(pose.hip.x + 4, pose.hip.y);
       ctx.closePath();
       ctx.fill();
-      ctx.stroke();
-    } else if (weaponType === 'dagger') {
-      // KURO: Split Shinobi Shadow Coat-Tails
-      ctx.fillStyle = '#140c24';
-      ctx.strokeStyle = accentColor;
-      ctx.lineWidth = 1.2;
+
+      ctx.fillStyle = clothDeep;
       ctx.beginPath();
-      ctx.moveTo(pose.hip.x - 2, pose.hip.y - 1);
-      ctx.lineTo(pose.hip.x - 13, pose.hip.y + 9);
-      ctx.lineTo(pose.hip.x - 5, pose.hip.y + 11);
-      ctx.lineTo(pose.hip.x + 1, pose.hip.y + 2);
+      ctx.moveTo(pose.spine.x - 1, pose.spine.y - 1);
+      ctx.quadraticCurveTo(
+        pose.hip.x - 10 + windCoatX * 0.6,
+        pose.hip.y + 5,
+        pose.hip.x - 14.5 + windCoatX,
+        pose.hip.y + 13.5 + windCoatY
+      );
+      ctx.lineTo(pose.hip.x - 5 + windCoatX * 0.6, pose.hip.y + 10.5 + windCoatY * 0.6);
+      ctx.lineTo(pose.hip.x + 1.5, pose.hip.y + 12.5 + windCoatY * 0.4);
+      ctx.lineTo(pose.hip.x + 3, pose.hip.y);
       ctx.closePath();
       ctx.fill();
-      ctx.stroke();
-    } else if (weaponType === 'orbs') {
-      // NYX: Flowing High-Slit Astral Empress Gown Panels
-      ctx.fillStyle = '#1f0924';
-      ctx.strokeStyle = accentColor;
-      ctx.lineWidth = 1.3;
+
+      // Glowing hem border on coat-tails
+      ctx.strokeStyle =
+        weaponType === 'scythe' || weaponType === 'claws' ? secondaryColor : accentColor;
+      ctx.lineWidth = 1.25;
       ctx.beginPath();
-      ctx.moveTo(pose.hip.x - 3, pose.hip.y - 2);
-      ctx.quadraticCurveTo(pose.hip.x - 14, pose.hip.y + 7, pose.hip.x - 9, pose.hip.y + 15);
-      ctx.lineTo(pose.hip.x + 2, pose.hip.y + 8);
+      ctx.moveTo(pose.hip.x - 14 + windCoatX, pose.hip.y + 13.5 + windCoatY);
+      ctx.lineTo(pose.hip.x - 5 + windCoatX * 0.6, pose.hip.y + 10.5 + windCoatY * 0.6);
+      ctx.lineTo(pose.hip.x + 1.5, pose.hip.y + 12.5 + windCoatY * 0.4);
+      ctx.stroke();
+    }
+
+    // =========================================================================
+    // 2. BACK ARM & BACK LEG (Sculpted Thigh, Calf Greave, Boot & Forearm)
+    // =========================================================================
+    drawCelLimb(
+      pose.shoulderB,
+      pose.elbowB,
+      limbW * 1.35,
+      limbW * 1.1,
+      clothDeep,
+      clothBase,
+      outlineColor,
+      false
+    );
+    drawCelLimb(
+      pose.elbowB,
+      pose.handB,
+      limbW * 1.3,
+      limbW * 0.95,
+      clothDeep,
+      clothBase,
+      outlineColor,
+      false
+    );
+    drawGlovedFist(pose.elbowB, pose.handB, false);
+
+    const thighMult = weaponType === 'katana' ? 2.25 : weaponType === 'titan' ? 1.75 : 1.55;
+    const calfMult = weaponType === 'katana' ? 1.65 : weaponType === 'titan' ? 1.55 : 1.35;
+    drawCelLimb(
+      pose.hip,
+      pose.kneeB,
+      limbW * thighMult,
+      limbW * (thighMult * 0.8),
+      clothDeep,
+      pantsColor,
+      outlineColor,
+      false
+    );
+    drawCelLimb(
+      pose.kneeB,
+      pose.footB,
+      limbW * calfMult,
+      limbW * 0.95,
+      clothDeep,
+      bootColor,
+      outlineColor,
+      false
+    );
+    drawCombatBoot(pose.kneeB, pose.footB, false);
+
+    // =========================================================================
+    // 3. SCULPTED ANATOMICAL V-TAPER TORSO, PELVIS, BELT & ARMOR CHESTPLATE
+    // =========================================================================
+    const chestHalfW = weaponType === 'titan' ? 7.2 : weaponType === 'spear' ? 5.6 : 4.8;
+    const waistHalfW = weaponType === 'titan' ? 5.2 : 3.4;
+    const hipHalfW = weaponType === 'titan' ? 5.6 : 4.0;
+
+    // 3A) Pelvis / Hip Block & Tassets (Kusazuri / Belt Skirt)
+    ctx.fillStyle = darkInk;
+    ctx.beginPath();
+    ctx.moveTo(pose.spine.x - waistHalfW - 1.3, pose.spine.y);
+    ctx.lineTo(pose.spine.x + waistHalfW + 1.3, pose.spine.y);
+    ctx.lineTo(pose.hip.x + hipHalfW + 1.5, pose.hip.y + 4);
+    ctx.lineTo(pose.hip.x - hipHalfW - 1.5, pose.hip.y + 4);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = pantsColor;
+    ctx.beginPath();
+    ctx.moveTo(pose.spine.x - waistHalfW, pose.spine.y);
+    ctx.lineTo(pose.spine.x + waistHalfW, pose.spine.y);
+    ctx.lineTo(pose.hip.x + hipHalfW, pose.hip.y + 3);
+    ctx.lineTo(pose.hip.x - hipHalfW, pose.hip.y + 3);
+    ctx.closePath();
+    ctx.fill();
+
+    // 3B) Sculpted V-Taper Ribcage & Chest Polygon
+    ctx.fillStyle = darkInk;
+    ctx.beginPath();
+    ctx.moveTo(pose.chest.x - chestHalfW - 1.4, pose.chest.y - 2);
+    ctx.lineTo(pose.chest.x + chestHalfW + 1.4, pose.chest.y - 2);
+    ctx.lineTo(pose.spine.x + waistHalfW + 1.4, pose.spine.y + 1);
+    ctx.lineTo(pose.spine.x - waistHalfW - 1.4, pose.spine.y + 1);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = clothBase;
+    ctx.beginPath();
+    ctx.moveTo(pose.chest.x - chestHalfW, pose.chest.y - 1);
+    ctx.lineTo(pose.chest.x + chestHalfW, pose.chest.y - 1);
+    ctx.lineTo(pose.spine.x + waistHalfW, pose.spine.y + 0.5);
+    ctx.lineTo(pose.spine.x - waistHalfW, pose.spine.y + 0.5);
+    ctx.closePath();
+    ctx.fill();
+
+    // Front Cel-Shaded Chest Light Plane & Rim Highlight
+    if (!isFlashOrImpact) {
+      ctx.fillStyle =
+        weaponType === 'chains' ? '#eab688' : clothLight; // Sol exposes muscular solar chest!
+      ctx.beginPath();
+      ctx.moveTo(pose.chest.x - 1, pose.chest.y - 1);
+      ctx.lineTo(pose.chest.x + chestHalfW, pose.chest.y - 1);
+      ctx.lineTo(pose.spine.x + waistHalfW, pose.spine.y + 0.5);
+      ctx.lineTo(pose.spine.x - 0.5, pose.spine.y + 0.5);
       ctx.closePath();
       ctx.fill();
-      ctx.stroke();
-    } else if (weaponType === 'claws') {
-      // JIN: Cyber-Puppeteer Split Duster Coat
-      ctx.fillStyle = '#0e1329';
-      ctx.strokeStyle = secondaryColor;
-      ctx.lineWidth = 1.2;
+
+      // Crisp front torso rim-light edge
+      ctx.strokeStyle = outlineColor;
+      ctx.lineWidth = 1.1;
       ctx.beginPath();
-      ctx.moveTo(pose.spine.x - 2, pose.spine.y);
-      ctx.lineTo(pose.hip.x - 12, pose.hip.y + 12);
-      ctx.lineTo(pose.hip.x - 2, pose.hip.y + 10);
-      ctx.lineTo(pose.hip.x + 2, pose.hip.y);
-      ctx.closePath();
-      ctx.fill();
+      ctx.moveTo(pose.chest.x + chestHalfW, pose.chest.y - 1);
+      ctx.lineTo(pose.spine.x + waistHalfW, pose.spine.y + 0.5);
       ctx.stroke();
-    }
 
-    // 2. Back Arm & Back Leg (with character-specific Hakama / Greaves / Thrusters)
-    strokeTaperedSegment(pose.shoulderB, pose.elbowB, limbW * 1.05, limbW * 0.9, bodyColor, outlineColor);
-    strokeTaperedSegment(pose.elbowB, pose.handB, limbW * 1.15, limbW * 0.85, bodyColor, outlineColor);
-
-    if (weaponType === 'katana') {
-      // KENJI: Wide Pleated Samurai Hakama Trousers on Back Leg
-      strokeTaperedSegment(pose.hip, pose.kneeB, limbW * 2.1, limbW * 1.8, '#0f172a', outlineColor);
-      strokeTaperedSegment(pose.kneeB, pose.footB, limbW * 1.5, limbW * 0.85, bodyColor, outlineColor);
-    } else {
-      strokeTaperedSegment(pose.hip, pose.kneeB, limbW * 1.25, limbW * 1.0, bodyColor, outlineColor);
-      strokeTaperedSegment(pose.kneeB, pose.footB, limbW * 1.15, limbW * 0.85, bodyColor, outlineColor);
-    }
-
-    // 3. Sculpted Anatomical Torso / Armor Chestplate (replaces thin spine stick!)
-    const chestW = weaponType === 'titan' ? 6.4 : weaponType === 'spear' ? 4.8 : 4.0;
-    const waistW = weaponType === 'titan' ? 4.6 : 2.6;
-    strokeTaperedSegment(pose.chest, pose.spine, chestW * 2, waistW * 1.9, bodyColor, outlineColor);
-    strokeTaperedSegment(pose.spine, pose.hip, waistW * 1.8, waistW * 1.9, bodyColor, outlineColor);
-
-    // Character-Specific Chest Emblem / Sash / Belt Details
-    if (weaponType === 'dagger') {
-      // Kuro X-Harness Straps across chest
-      ctx.strokeStyle = accentColor;
-      ctx.lineWidth = 1.3;
-      ctx.beginPath();
-      ctx.moveTo(pose.chest.x - 3, pose.chest.y - 2);
-      ctx.lineTo(pose.spine.x + 3, pose.spine.y + 2);
-      ctx.moveTo(pose.chest.x + 3, pose.chest.y - 2);
-      ctx.lineTo(pose.spine.x - 3, pose.spine.y + 2);
-      ctx.stroke();
-    } else if (weaponType === 'gauntlet') {
-      // Velo Glowing Velocity Reactor Core on chest
+      // Waist Obi Sash / Tactical Belt + Buckle
+      ctx.fillStyle =
+        weaponType === 'katana' || weaponType === 'dagger' || weaponType === 'chains'
+          ? accentColor
+          : '#0f172a';
+      ctx.fillRect(
+        pose.spine.x - waistHalfW - 0.5,
+        pose.spine.y - 1.2,
+        waistHalfW * 2 + 1,
+        2.8
+      );
       ctx.fillStyle = secondaryColor;
-      ctx.beginPath();
-      ctx.arc(pose.chest.x + 1, pose.chest.y + 1, 2.2, 0, Math.PI * 2);
-      ctx.fill();
-    } else if (weaponType === 'titan') {
-      // Bram Tectonic Championship Belt & Chest Plate
-      ctx.fillStyle = secondaryColor;
-      ctx.fillRect(pose.hip.x - 5, pose.hip.y - 2, 10, 3.2);
-      ctx.strokeStyle = accentColor;
-      ctx.lineWidth = 1.6;
-      ctx.beginPath();
-      ctx.moveTo(pose.chest.x - 5, pose.chest.y + 1);
-      ctx.lineTo(pose.chest.x + 5, pose.chest.y + 1);
-      ctx.stroke();
-    } else if (weaponType === 'scythe') {
-      // Chrono Golden Clock-Heart on chest
-      ctx.strokeStyle = secondaryColor;
-      ctx.lineWidth = 1.2;
-      ctx.beginPath();
-      ctx.arc(pose.chest.x + 1, pose.chest.y + 1, 2.5, 0, Math.PI * 2);
-      ctx.stroke();
-    } else if (weaponType === 'chains') {
-      // Sol Blazing Solar Sash & Chest Brand
-      ctx.fillStyle = secondaryColor;
-      ctx.fillRect(pose.hip.x - 4, pose.hip.y - 1.5, 8, 2.5);
+      ctx.fillRect(pose.spine.x + 0.5, pose.spine.y - 1.4, 3.2, 3.0);
     }
 
-    // 4. Front Leg (with Hakama / Aero-Jet Fins / Armored Greaves)
-    if (weaponType === 'katana') {
-      // KENJI: Wide Pleated Samurai Hakama Trousers on Front Leg + White Tabi Socks
-      strokeTaperedSegment(pose.hip, pose.kneeF, limbW * 2.2, limbW * 1.9, '#111827', outlineColor);
-      strokeTaperedSegment(pose.kneeF, pose.footF, limbW * 1.5, limbW * 0.9, bodyColor, outlineColor);
-      ctx.fillStyle = '#f8fafc';
-      ctx.fillRect(pose.footF.x - 2, pose.footF.y - 2, 4.5, 2.5);
-    } else {
-      strokeTaperedSegment(pose.hip, pose.kneeF, limbW * 1.3, limbW * 1.05, bodyColor, outlineColor);
-      strokeTaperedSegment(pose.kneeF, pose.footF, limbW * 1.2, limbW * 0.9, bodyColor, outlineColor);
+    // Character-Specific Chest Armor, Haori Lapels, Harnesses & Reactor Cores
+    if (!isFlashOrImpact) {
+      if (weaponType === 'dagger') {
+        // Kuro: Crossed Shinobi Kunai Harness & Violet Core
+        ctx.strokeStyle = accentColor;
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.moveTo(pose.chest.x - 3.5, pose.chest.y - 1);
+        ctx.lineTo(pose.spine.x + 3.5, pose.spine.y);
+        ctx.moveTo(pose.chest.x + 3.5, pose.chest.y - 1);
+        ctx.lineTo(pose.spine.x - 3.5, pose.spine.y);
+        ctx.stroke();
+        ctx.fillStyle = secondaryColor;
+        ctx.fillRect(pose.chest.x - 1, pose.chest.y + 1, 2.2, 2.2);
+      } else if (weaponType === 'gauntlet') {
+        // Velo: Glowing Cyan-Gold Turbine Chest Core & Racing Stripes
+        ctx.fillStyle = secondaryColor;
+        ctx.beginPath();
+        ctx.arc(pose.chest.x + 1.5, pose.chest.y + 1.5, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(pose.chest.x + 1, pose.chest.y + 1, 1.5, 1.5);
+      } else if (weaponType === 'katana') {
+        // Kenji: White Inner Kosode Collar V-Lapel & Crimson Haori Trim
+        ctx.strokeStyle = '#f8fafc';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(pose.chest.x - 1.5, pose.chest.y - 1.5);
+        ctx.lineTo(pose.chest.x + 2.5, pose.chest.y + 4);
+        ctx.lineTo(pose.chest.x + 4, pose.chest.y - 1.5);
+        ctx.stroke();
+      } else if (weaponType === 'titan') {
+        // Bram: Glowing Emerald Gravity Furnace Core & Segmented Rib Plates
+        ctx.strokeStyle = accentColor;
+        ctx.lineWidth = 1.8;
+        ctx.beginPath();
+        ctx.moveTo(pose.chest.x - 5.5, pose.chest.y + 1.5);
+        ctx.lineTo(pose.chest.x + 5.5, pose.chest.y + 1.5);
+        ctx.stroke();
+        ctx.fillStyle = secondaryColor;
+        ctx.fillRect(pose.chest.x + 0.5, pose.chest.y, 3.2, 3.2);
+      } else if (weaponType === 'spear') {
+        // Raijin: Golden Cloud-Pattern Gi Lapel & Shimenawa Rope Belt
+        ctx.strokeStyle = secondaryColor;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(pose.chest.x - 2, pose.chest.y - 1);
+        ctx.lineTo(pose.spine.x + 2, pose.spine.y);
+        ctx.stroke();
+      } else if (weaponType === 'scythe') {
+        // Chrono: Golden Clockwork Astrolabe Heart on Chest
+        ctx.strokeStyle = secondaryColor;
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.arc(pose.chest.x + 1.5, pose.chest.y + 1.5, 2.8, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.fillStyle = accentColor;
+        ctx.fillRect(pose.chest.x + 1, pose.chest.y + 1, 1.5, 1.5);
+      } else if (weaponType === 'chains') {
+        // Sol: Blazing Phoenix Brand Tattoo on Chest & Flame Sash Tails
+        ctx.fillStyle = secondaryColor;
+        ctx.beginPath();
+        ctx.arc(pose.chest.x + 2, pose.chest.y + 1.5, 2.0, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (weaponType === 'orbs') {
+        // Nyx: Faceted Astral Star-Gem on Chest Bodice
+        ctx.fillStyle = secondaryColor;
+        ctx.beginPath();
+        ctx.moveTo(pose.chest.x + 2, pose.chest.y - 1);
+        ctx.lineTo(pose.chest.x + 4, pose.chest.y + 1.5);
+        ctx.lineTo(pose.chest.x + 2, pose.chest.y + 4);
+        ctx.lineTo(pose.chest.x, pose.chest.y + 1.5);
+        ctx.closePath();
+        ctx.fill();
+      } else if (weaponType === 'claws') {
+        // Jin: Glowing Teal Chakra-Circuit Ribs on Trenchcoat
+        ctx.strokeStyle = secondaryColor;
+        ctx.lineWidth = 1.3;
+        ctx.beginPath();
+        ctx.moveTo(pose.chest.x - 2, pose.chest.y);
+        ctx.lineTo(pose.chest.x + 3.5, pose.chest.y + 1);
+        ctx.moveTo(pose.chest.x - 2, pose.chest.y + 3);
+        ctx.lineTo(pose.chest.x + 3, pose.chest.y + 4);
+        ctx.stroke();
+      }
     }
 
-    if (weaponType === 'gauntlet') {
-      // VELO: Winged Aero-Jet Boots on both ankles
+    // =========================================================================
+    // 4. FRONT LEG (Sculpted Thigh, Knee Poleyn Armor, Calf Greave & Boot)
+    // =========================================================================
+    drawCelLimb(
+      pose.hip,
+      pose.kneeF,
+      limbW * (thighMult + 0.1),
+      limbW * (thighMult * 0.82),
+      pantsColor,
+      clothLight,
+      outlineColor,
+      true
+    );
+    drawCelLimb(
+      pose.kneeF,
+      pose.footF,
+      limbW * (calfMult + 0.08),
+      limbW * 1.0,
+      bootColor,
+      clothLight,
+      outlineColor,
+      true
+    );
+
+    // Knee Guard (Poleyn) highlight on Front Knee
+    if (!isFlashOrImpact && weaponType !== 'katana') {
+      ctx.fillStyle = darkInk;
+      ctx.fillRect(pose.kneeF.x - 2.2, pose.kneeF.y - 2.5, 4.8, 4.5);
+      ctx.fillStyle = weaponType === 'titan' ? secondaryColor : accentColor;
+      ctx.fillRect(pose.kneeF.x - 1.2, pose.kneeF.y - 1.6, 3.0, 2.8);
+    }
+
+    drawCombatBoot(pose.kneeF, pose.footF, true);
+
+    if (weaponType === 'gauntlet' && !isFlashOrImpact) {
+      // VELO: Winged Aero-Jet Exhaust Fins on Both Ankles
       for (const ft of [pose.footF, pose.footB]) {
         ctx.fillStyle = accentColor;
         ctx.beginPath();
-        ctx.moveTo(ft.x + 3, ft.y);
-        ctx.lineTo(ft.x - 6, ft.y - 4);
-        ctx.lineTo(ft.x - 4, ft.y + 1);
+        ctx.moveTo(ft.x + 2, ft.y - 1);
+        ctx.lineTo(ft.x - 7, ft.y - 5);
+        ctx.lineTo(ft.x - 4, ft.y + 0.5);
         ctx.closePath();
         ctx.fill();
         ctx.fillStyle = secondaryColor;
-        ctx.fillRect(ft.x - 5, ft.y - 2, 3, 2);
+        ctx.fillRect(ft.x - 5.5, ft.y - 3, 3, 2);
       }
-    } else if (weaponType === 'titan') {
-      // BRAM: Heavy Knee-Spike Greaves
-      ctx.fillStyle = secondaryColor;
-      ctx.fillRect(pose.kneeF.x - 1, pose.kneeF.y - 3, 4, 4);
     }
 
-    // 5. Front Arm & Shoulder Pauldrons
-    strokeTaperedSegment(pose.shoulderF, pose.elbowF, limbW * 1.1, limbW * 0.95, bodyColor, outlineColor);
-    strokeTaperedSegment(pose.elbowF, pose.handF, limbW * 1.25, limbW * 0.9, bodyColor, outlineColor);
+    // =========================================================================
+    // 5. FRONT ARM, FOREARM VAMBRACE, SHOULDER PAULDRONS & GLOVED FIST
+    // =========================================================================
+    drawCelLimb(
+      pose.shoulderF,
+      pose.elbowF,
+      limbW * 1.45,
+      limbW * 1.18,
+      skinOrSleeve,
+      clothLight,
+      outlineColor,
+      true
+    );
+    drawCelLimb(
+      pose.elbowF,
+      pose.handF,
+      limbW * 1.4,
+      limbW * 1.05,
+      clothBase,
+      accentColor,
+      secondaryColor,
+      true
+    );
+    drawGlovedFist(pose.elbowF, pose.handF, true);
 
-    if (weaponType === 'titan') {
-      // BRAM: Massive Segmented Colossus Shoulder Pauldrons
-      for (const sh of [pose.shoulderF, pose.shoulderB]) {
-        ctx.fillStyle = '#05070d';
+    // Sculpted Shoulder Pauldrons / Sode / Haori Sleeves
+    if (!isFlashOrImpact) {
+      if (weaponType === 'titan') {
+        for (const sh of [pose.shoulderF, pose.shoulderB]) {
+          ctx.fillStyle = darkInk;
+          ctx.beginPath();
+          ctx.arc(sh.x, sh.y - 1, 6.2, Math.PI * 0.85, Math.PI * 2.15);
+          ctx.fill();
+          ctx.fillStyle = accentColor;
+          ctx.beginPath();
+          ctx.arc(sh.x, sh.y - 1, 4.8, Math.PI, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = secondaryColor;
+          ctx.fillRect(sh.x - 2, sh.y - 4.5, 4, 2.2);
+        }
+      } else {
+        // Layered Shoulder Guard / Sleeve Cap on Front Shoulder
+        ctx.fillStyle = darkInk;
         ctx.beginPath();
-        ctx.arc(sh.x, sh.y - 1, 5.5, Math.PI * 0.9, Math.PI * 2.1);
+        ctx.arc(pose.shoulderF.x, pose.shoulderF.y - 0.5, 4.4, Math.PI * 0.8, Math.PI * 2.1);
         ctx.fill();
-        ctx.fillStyle = accentColor;
+        ctx.fillStyle = clothLight;
         ctx.beginPath();
-        ctx.arc(sh.x, sh.y - 1, 4.2, Math.PI, Math.PI * 2);
+        ctx.arc(pose.shoulderF.x, pose.shoulderF.y - 0.5, 3.2, Math.PI * 0.9, Math.PI * 2.05);
         ctx.fill();
-        ctx.fillStyle = secondaryColor;
-        ctx.fillRect(sh.x - 1.5, sh.y - 4, 3, 2);
+        ctx.strokeStyle = secondaryColor;
+        ctx.lineWidth = 1.1;
+        ctx.beginPath();
+        ctx.moveTo(pose.shoulderF.x - 3, pose.shoulderF.y + 0.5);
+        ctx.lineTo(pose.shoulderF.x + 3.2, pose.shoulderF.y + 0.5);
+        ctx.stroke();
       }
-    } else if (weaponType === 'spear' || weaponType === 'scythe') {
-      // RAIJIN / CHRONO: Ornate Golden Shoulder Epaulettes / Sode Armor
-      ctx.fillStyle = secondaryColor;
-      ctx.beginPath();
-      ctx.moveTo(pose.shoulderF.x - 4, pose.shoulderF.y - 3);
-      ctx.lineTo(pose.shoulderF.x + 5, pose.shoulderF.y - 1);
-      ctx.lineTo(pose.shoulderF.x + 3, pose.shoulderF.y + 3);
-      ctx.lineTo(pose.shoulderF.x - 3, pose.shoulderF.y + 1);
-      ctx.closePath();
-      ctx.fill();
     }
 
     void outlineW;
@@ -3583,17 +5845,20 @@ export class HDPixelRenderer {
     squashY: number,
     drawWeapon: boolean,
     alpha = 1,
-    hasEyeTrail = false
+    hasEyeTrail = false,
+    vx = 0,
+    vy = 0
   ): void {
     ctx.save();
     ctx.globalAlpha = alpha;
     ctx.translate(Math.round(x), Math.round(y));
     ctx.scale(facing * squashX, squashY);
 
-    const limbW = weaponType === 'titan' ? 4.5 : 3.2;
+    const limbW = weaponType === 'titan' ? 4.8 : 3.5;
     const outlineW = limbW + 2.4;
+    const localVx = vx * facing;
 
-    // 1. Sculpted Anatomical Body, Garments, Coats, Hakama, Pauldrons & Greaves
+    // 1. Sculpted Cel-Shaded Body, Garments, Coats, Hakama, Pauldrons, Greaves, Boots & Fists
     this.drawCharacterBodyAndGarments(
       ctx,
       pose,
@@ -3603,19 +5868,24 @@ export class HDPixelRenderer {
       secondaryColor,
       weaponType,
       limbW,
-      outlineW
+      outlineW,
+      localVx,
+      vy
     );
 
-    // 2. Character-Distinct Head, Hair, Helmet, Hat, Horns & Mask
+    // 2. Character-Distinct Head, Jawline, Hair, Helmet, Hat, Horns & Mask
     this.drawCharacterHeadAndHair(
       ctx,
       pose.head,
+      pose.chest,
       bodyColor,
       outlineColor,
       accentColor,
       secondaryColor,
       weaponType,
-      hasEyeTrail
+      hasEyeTrail,
+      localVx,
+      vy
     );
 
     // 3. Hand-Crafted Multi-Layered Masterwork Weapon
@@ -3641,6 +5911,28 @@ export class HDPixelRenderer {
     tick: number
   ): void {
     if (f.action === 'ko_respawn') return;
+
+    // 0. Dynamic Ground Contact Shadow beneath Fighter
+    if (!isImpact) {
+      const shadowScale = f.grounded ? 1.0 : Math.max(0.35, 1 - Math.abs(106 - f.y) / 140);
+      if (shadowScale > 0.36) {
+        const shadowY = f.grounded ? f.y + 18 : 124;
+        ctx.save();
+        ctx.fillStyle = `rgba(2, 6, 23, ${0.46 * shadowScale})`;
+        ctx.beginPath();
+        ctx.ellipse(
+          Math.round(f.x),
+          Math.round(shadowY),
+          (f.id === 'bram' ? 16 : 12.5) * shadowScale,
+          3.2 * shadowScale,
+          0,
+          0,
+          Math.PI * 2
+        );
+        ctx.fill();
+        ctx.restore();
+      }
+    }
 
     // 1. Character-Specific Ambient & State Auras
     if (f.overdriveTimer > 0) {
@@ -3838,22 +6130,41 @@ export class HDPixelRenderer {
       ctx.restore();
     }
 
-    // 2. Flowing Verlet Scarf
-    if (!isImpact && f.scarf.length > 1) {
+    // 2. Flowing Cel-Shaded Verlet Scarf / Cape Ribbon (with dark border & highlight fold!)
+    if (!isImpact && f.scarf.length > 2) {
       ctx.save();
-      ctx.strokeStyle = f.spec.scarfColor;
+      // Dark Ink Outer Border
+      ctx.strokeStyle = '#04060c';
       ctx.lineCap = 'round';
       for (let i = 0; i < f.scarf.length - 1; i++) {
-        ctx.lineWidth = Math.max(1.2, 3.8 - i * 0.5);
+        ctx.lineWidth = Math.max(2.6, 7.0 - i * 0.62);
         ctx.beginPath();
-        ctx.moveTo(Math.round(f.scarf[i].x), Math.round(f.scarf[i].y));
-        ctx.lineTo(Math.round(f.scarf[i + 1].x), Math.round(f.scarf[i + 1].y));
+        ctx.moveTo(f.scarf[i].x, f.scarf[i].y);
+        ctx.lineTo(f.scarf[i + 1].x, f.scarf[i + 1].y);
         ctx.stroke();
       }
+      // Main Scarf Body Fill
+      ctx.strokeStyle = f.spec.scarfColor;
+      for (let i = 0; i < f.scarf.length - 1; i++) {
+        ctx.lineWidth = Math.max(1.4, 4.8 - i * 0.5);
+        ctx.beginPath();
+        ctx.moveTo(f.scarf[i].x, f.scarf[i].y);
+        ctx.lineTo(f.scarf[i + 1].x, f.scarf[i + 1].y);
+        ctx.stroke();
+      }
+      // Top Edge Highlight Trim
+      ctx.strokeStyle = f.spec.secondaryColor;
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      for (let i = 0; i < f.scarf.length; i++) {
+        if (i === 0) ctx.moveTo(f.scarf[i].x, f.scarf[i].y - 1.2);
+        else ctx.lineTo(f.scarf[i].x, f.scarf[i].y - 1.2);
+      }
+      ctx.stroke();
       ctx.restore();
     }
 
-    const pose = this.computePose(
+    const rawPose = this.computePose(
       f.action,
       f.currentMove,
       f.currentMove?.key ?? null,
@@ -3862,8 +6173,35 @@ export class HDPixelRenderer {
       f.vx,
       f.vy,
       f.grounded,
-      f.spec.weaponType
+      f.spec.weaponType,
+      f.ultPose
     );
+
+    // Continuous Per-Fighter Skeleton Pose Interpolation (eliminates 1-frame state-transition snapping!)
+    const prevRecord = this.smoothedPoses.get(f.slot);
+    let pose = rawPose;
+    if (
+      prevRecord &&
+      Math.abs(tick - prevRecord.tick) <= 6 &&
+      Math.hypot(f.x - prevRecord.x, f.y - prevRecord.y) < 110
+    ) {
+      const blendRate =
+        f.action === 'attack'
+          ? 0.46
+          : f.action === 'ultimate'
+          ? 0.36
+          : f.action === 'walk' || f.action === 'dash'
+          ? 0.34
+          : 0.32;
+      pose = blendPose(prevRecord.pose, rawPose, blendRate);
+    }
+    this.smoothedPoses.set(f.slot, {
+      pose,
+      x: f.x,
+      y: f.y,
+      facing: f.facing,
+      tick,
+    });
 
     const hasSuperArmor =
       f.currentMove?.superArmorFrames &&
@@ -3893,10 +6231,14 @@ export class HDPixelRenderer {
     const hasEyeTrail =
       f.action === 'dash' ||
       f.action === 'airdodge' ||
+      f.action === 'ultimate' ||
       f.overdriveTimer > 0 ||
       f.action === 'kuro_suspend' ||
       f.action === 'kenji_haki' ||
       (f.action === 'attack' && f.currentMove?.category === 'special');
+
+    // 2.5D Z-Depth Foreshortening Scale ($S(z) = \frac{260}{260 + z}$, negative z = closer to camera = larger!)
+    const zScale = f.z ? Math.max(0.68, Math.min(1.52, 260 / (260 + f.z))) : 1;
 
     this.drawStickSkeleton(
       ctx,
@@ -3909,11 +6251,13 @@ export class HDPixelRenderer {
       accent,
       secondary,
       f.spec.weaponType,
-      f.squashX,
-      f.squashY,
+      f.squashX * zScale,
+      f.squashY * zScale,
       true,
       alpha,
-      hasEyeTrail
+      hasEyeTrail,
+      f.vx,
+      f.vy
     );
 
     // Player indicator caret above head
