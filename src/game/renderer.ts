@@ -1,3 +1,6 @@
+import { blendPoseArc, sampleAttack } from './poseKit';
+import { hexToRgb, drawShockRing, drawStreak, drawStarFlare, drawArcSweep } from './vfxKit';
+import { getAuthoredMove } from './movePoses';
 import {
   Afterimage,
   DelayedSlash,
@@ -83,32 +86,7 @@ function easeInOutCubic(t: number): number {
 }
 
 function blendPose(a: SkeletonPose, b: SkeletonPose, t: number): SkeletonPose {
-  const k = clamp01(t);
-  return {
-    hip: lerpVec(a.hip, b.hip, k),
-    spine: lerpVec(a.spine, b.spine, k),
-    chest: lerpVec(a.chest, b.chest, k),
-    head: lerpVec(a.head, b.head, k),
-    shoulderF: lerpVec(a.shoulderF, b.shoulderF, k),
-    elbowF: lerpVec(a.elbowF, b.elbowF, k),
-    handF: lerpVec(a.handF, b.handF, k),
-    shoulderB: lerpVec(a.shoulderB, b.shoulderB, k),
-    elbowB: lerpVec(a.elbowB, b.elbowB, k),
-    handB: lerpVec(a.handB, b.handB, k),
-    kneeF: lerpVec(a.kneeF, b.kneeF, k),
-    footF: lerpVec(a.footF, b.footF, k),
-    kneeB: lerpVec(a.kneeB, b.kneeB, k),
-    footB: lerpVec(a.footB, b.footB, k),
-    weaponAngle: lerpAngle(a.weaponAngle, b.weaponAngle, k),
-    weaponReach: lerp(a.weaponReach, b.weaponReach, k),
-    offhandWeaponAngle:
-      a.offhandWeaponAngle !== undefined && b.offhandWeaponAngle !== undefined
-        ? lerpAngle(a.offhandWeaponAngle, b.offhandWeaponAngle, k)
-        : b.offhandWeaponAngle ?? a.offhandWeaponAngle,
-    sheathed: k < 0.5 ? a.sheathed : b.sheathed,
-    smearAlpha: lerp(a.smearAlpha ?? 0, b.smearAlpha ?? 0, k),
-    smearSpan: lerp(a.smearSpan ?? 0, b.smearSpan ?? 0, k),
-  };
+  return blendPoseArc(a, b, t);
 }
 
 // Staggered Kinetic-Chain & Circular Arc Swing Blender (Hip -> Torso -> Shoulder -> Elbow -> Hand/Weapon)
@@ -3736,37 +3714,13 @@ export class HDPixelRenderer {
       const active = move?.active ?? 8;
       const recovery = move?.recovery ?? 14;
 
-      const inWindup = frame < startup;
-      const inActive = frame >= startup && frame < startup + active;
-      const windupT = easeInOutCubic(frame / Math.max(1, startup));
-      const activeProgress = clamp01((frame - startup) / Math.max(1, active));
-      const recovT = easeInOutCubic((frame - startup - active) / Math.max(1, recovery));
+      // Authored (offset-based) poses win; moves not yet authored fall back to the legacy keyframes.
+      const authored = getAuthoredMove(base, moveKey, weaponType, grounded);
+      const windupPose = authored?.windup ?? this.getMoveWindupPose(base, moveKey, weaponType, grounded);
+      const strikePose = authored?.strike ?? this.getMoveStrikePose(base, moveKey, weaponType, grounded);
+      const followPose = authored?.follow ?? this.getMoveFollowPose(strikePose, moveKey, grounded);
 
-      const windupPose = this.getMoveWindupPose(base, moveKey, weaponType, grounded);
-      const strikePose = this.getMoveStrikePose(base, moveKey, weaponType, grounded);
-      const followPose = this.getMoveFollowPose(strikePose, moveKey, grounded);
-
-      if (inWindup) {
-        return blendPose(base, windupPose, windupT);
-      } else if (inActive) {
-        // First 65% of active window swings along a curved martial-arts trajectory; final 35% holds the impact extension clearly!
-        const swingPhase = clamp01(activeProgress / 0.65);
-        const holdPhase = clamp01((activeProgress - 0.65) / 0.35);
-        let p = blendStrikeSwingPose(windupPose, strikePose, swingPhase);
-        if (holdPhase > 0) {
-          p = blendPose(p, followPose, holdPhase * 0.32);
-        }
-        p.smearAlpha = 0.85 * Math.sin(activeProgress * Math.PI);
-        p.smearSpan = strikePose.smearSpan ?? 1.1;
-        return p;
-      } else {
-        if (recovT < 0.38) {
-          const settleT = easeOutCubic(recovT / 0.38);
-          return blendPose(strikePose, followPose, settleT);
-        }
-        const returnT = easeInOutCubic((recovT - 0.38) / 0.62);
-        return blendPose(followPose, base, returnT);
-      }
+      return sampleAttack(base, windupPose, strikePose, followPose, { startup, active, recovery }, frame, authored?.style);
     }
 
     return base;
@@ -6187,7 +6141,7 @@ export class HDPixelRenderer {
     ) {
       const blendRate =
         f.action === 'attack'
-          ? 0.46
+          ? 1
           : f.action === 'ultimate'
           ? 0.36
           : f.action === 'walk' || f.action === 'dash'
@@ -6480,74 +6434,28 @@ export class HDPixelRenderer {
 
   // Tapered Crescent Anime Slash Arc with outer glow & white-hot core
   private drawSlashArc(ctx: CanvasRenderingContext2D, arc: SlashArc): void {
+    // Sweeping tapered ribbon (see docs/VFX_SKILL.md): head races along the arc, tail lags and fades.
     const progress = clamp01(1 - arc.life / arc.maxLife);
-    const alpha = Math.max(0, 1 - Math.pow(progress, 1.6));
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.translate(Math.round(arc.x), Math.round(arc.y));
-    ctx.scale(arc.facing, 1);
-
-    const steps = 16;
-    const span = arc.angleEnd - arc.angleStart;
-    const maxThick = arc.thickness * (1 - progress * 0.35);
-
-    const buildCrescent = (thickScale: number, radOffset: number) => {
-      ctx.beginPath();
-      for (let i = 0; i <= steps; i++) {
-        const u = i / steps;
-        const ang = arc.angleStart + span * u;
-        const taper = Math.sin(u * Math.PI); // 0 at ends, 1 in middle
-        const r = arc.radius + radOffset + taper * maxThick * thickScale;
-        const px = Math.cos(ang) * r;
-        const py = Math.sin(ang) * r;
-        if (i === 0) ctx.moveTo(px, py);
-        else ctx.lineTo(px, py);
-      }
-      for (let i = steps; i >= 0; i--) {
-        const u = i / steps;
-        const ang = arc.angleStart + span * u;
-        const taper = Math.sin(u * Math.PI);
-        const r = arc.radius + radOffset - taper * maxThick * thickScale * 0.45;
-        const px = Math.cos(ang) * r;
-        const py = Math.sin(ang) * r;
-        ctx.lineTo(px, py);
-      }
-      ctx.closePath();
-    };
-
-    // Outer chromatic blade glow
-    ctx.fillStyle = arc.color;
-    buildCrescent(1.15, 0);
-    ctx.fill();
-
-    // Inner white-hot razor core
-    ctx.fillStyle = arc.coreColor;
-    buildCrescent(0.5, 1.2);
-    ctx.fill();
-
-    ctx.restore();
+    drawArcSweep(
+      ctx,
+      {
+        x: Math.round(arc.x),
+        y: Math.round(arc.y),
+        facing: arc.facing,
+        angleStart: arc.angleStart,
+        angleEnd: arc.angleEnd,
+        radius: arc.radius,
+        thickness: arc.thickness,
+        color: arc.color,
+        coreColor: arc.coreColor,
+      },
+      progress
+    );
   }
 
   private drawShockwave(ctx: CanvasRenderingContext2D, sw: ShockwaveRing): void {
     const t = clamp01(1 - sw.life / sw.maxLife);
-    const rad = lerp(4, sw.maxRadius, easeOutExpo(t));
-    ctx.save();
-    ctx.globalAlpha = Math.max(0, 1 - t);
-    ctx.strokeStyle = sw.color;
-    ctx.lineWidth = Math.max(1, sw.lineWidth * (1 - t * 0.75));
-    ctx.beginPath();
-    ctx.arc(Math.round(sw.x), Math.round(sw.y), rad, 0, Math.PI * 2);
-    ctx.stroke();
-
-    // Secondary inner echo ring
-    if (rad > 16) {
-      ctx.globalAlpha = Math.max(0, (1 - t) * 0.5);
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.arc(Math.round(sw.x), Math.round(sw.y), rad * 0.72, 0, Math.PI * 2);
-      ctx.stroke();
-    }
-    ctx.restore();
+    drawShockRing(ctx, Math.round(sw.x), Math.round(sw.y), t, sw.maxRadius, Math.max(2, sw.lineWidth * 2.4), hexToRgb(sw.color));
   }
 
   private drawParticle(ctx: CanvasRenderingContext2D, pt: Particle): void {
@@ -6557,42 +6465,13 @@ export class HDPixelRenderer {
     const sz = Math.max(1, pt.size);
 
     if (pt.shape === 'spark') {
-      // High-velocity anime directional streak with hot white center
-      ctx.strokeStyle = pt.color;
-      ctx.lineWidth = Math.max(1.2, sz * 0.75);
-      ctx.lineCap = 'round';
-      ctx.beginPath();
-      ctx.moveTo(Math.round(pt.x), Math.round(pt.y));
-      ctx.lineTo(Math.round(pt.x - pt.vx * 2.4), Math.round(pt.y - pt.vy * 2.4));
-      ctx.stroke();
-
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = Math.max(0.8, sz * 0.35);
-      ctx.beginPath();
-      ctx.moveTo(Math.round(pt.x), Math.round(pt.y));
-      ctx.lineTo(Math.round(pt.x - pt.vx * 1.2), Math.round(pt.y - pt.vy * 1.2));
-      ctx.stroke();
+      // Tapered, velocity-stretched additive streak with hot core
+      ctx.globalAlpha = 1;
+      drawStreak(ctx, pt.x, pt.y, pt.vx, pt.vy, sz, hexToRgb(pt.color), Math.min(1, alpha * 1.25), 2.3);
     } else if (pt.shape === 'flare') {
-      // 4-pointed anime star impact flare
-      ctx.translate(Math.round(pt.x), Math.round(pt.y));
-      if (pt.angle) ctx.rotate(pt.angle);
-      const rLong = sz * 3.2 * alpha;
-      const rShort = sz * 0.75 * alpha;
-      ctx.fillStyle = pt.color;
-      ctx.beginPath();
-      ctx.moveTo(0, -rLong);
-      ctx.lineTo(rShort, -rShort);
-      ctx.lineTo(rLong, 0);
-      ctx.lineTo(rShort, rShort);
-      ctx.lineTo(0, rLong);
-      ctx.lineTo(-rShort, rShort);
-      ctx.lineTo(-rLong, 0);
-      ctx.lineTo(-rShort, -rShort);
-      ctx.closePath();
-      ctx.fill();
-
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(-1.5, -1.5, 3, 3);
+      // Glowing 4-point anime star
+      ctx.globalAlpha = 1;
+      drawStarFlare(ctx, pt.x, pt.y, sz, pt.angle ?? 0, hexToRgb(pt.color), alpha);
     } else if (pt.shape === 'debris') {
       // Rotating stone/stage rubble chunk
       ctx.translate(Math.round(pt.x), Math.round(pt.y));
