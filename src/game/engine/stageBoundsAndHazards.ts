@@ -96,13 +96,24 @@ export function checkBounds(ctx: EngineContext, f: FighterState): void {
   if (!out) return;
   if (ctx.config.ruleset === 'hp' && f.y <= s.blastBottom) return;
 
+  const koX = Math.max(-360, Math.min(360, f.x));
+  const koY = Math.max(-200, Math.min(200, f.y));
   ctx.sound.playKO();
   ctx.shakeMag = 16;
   ctx.impactFrames = 4;
+  ctx.vfxEvents.push({
+    type: 'ko',
+    x: koX,
+    y: koY,
+    dir: Math.atan2(-f.y, -f.x),
+    power: 1.0,
+    color: f.spec.accentColor,
+    seed: ctx.tick,
+  });
   spawnHitSparks(
     ctx,
-    Math.max(-360, Math.min(360, f.x)),
-    Math.max(-200, Math.min(200, f.y)),
+    koX,
+    koY,
     f.spec.accentColor,
     36
   );

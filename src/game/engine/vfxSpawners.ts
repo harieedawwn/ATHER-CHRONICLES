@@ -5,6 +5,7 @@
  */
 
 import { FighterState, MoveData } from '../types';
+import { vrand } from '../vfxKit';
 import { EngineContext } from './context';
 
 export function spawnAfterimage(ctx: EngineContext, f: FighterState, color: string): void {
@@ -87,21 +88,21 @@ export function spawnHitSparks(
     gravity: 0,
     drag: 1,
     shape: 'flare',
-    angle: Math.random() * 0.6,
+    angle: vrand() * 0.6,
     spin: 0.08,
   });
 
   for (let i = 0; i < count; i++) {
-    const ang = Math.random() * Math.PI * 2;
-    const spd = 2.6 + Math.random() * 7.8;
+    const ang = vrand() * Math.PI * 2;
+    const spd = 2.6 + vrand() * 7.8;
     ctx.particles.push({
       x,
       y,
       vx: Math.cos(ang) * spd,
       vy: Math.sin(ang) * spd,
-      size: 2.2 + Math.random() * 2.8,
+      size: 2.2 + vrand() * 2.8,
       color: i % 3 === 0 ? '#ffffff' : color,
-      life: 11 + Math.floor(Math.random() * 11),
+      life: 11 + Math.floor(vrand() * 11),
       maxLife: 22,
       gravity: 0.14,
       drag: 0.91,
@@ -119,6 +120,14 @@ export function spawnDashWindCone(
   angle: number,
   color: string
 ): void {
+  ctx.vfxEvents.push({
+    type: 'dash',
+    x,
+    y,
+    dir: angle,
+    power: 0.5,
+    color,
+  });
   ctx.particles.push({
     x,
     y,
@@ -155,6 +164,15 @@ export function spawnBlinkBurst(
   y: number,
   color: string
 ): void {
+  ctx.vfxEvents.push({
+    type: 'blink',
+    x,
+    y,
+    dir: 0,
+    power: 0.65,
+    color,
+    seed: ctx.tick,
+  });
   ctx.shockwaves.push({
     x,
     y,
@@ -171,19 +189,19 @@ export function spawnBlinkBurst(
 export function spawnDust(ctx: EngineContext, x: number, y: number, dir: number): void {
   for (let i = 0; i < 6; i++) {
     ctx.particles.push({
-      x: x + (Math.random() - 0.5) * 14,
+      x: x + (vrand() - 0.5) * 14,
       y: y - 2,
-      vx: -dir * (0.9 + Math.random() * 2.2) + (Math.random() - 0.5) * 1.6,
-      vy: -0.6 - Math.random() * 1.5,
-      size: 2.5 + Math.random() * 1.5,
+      vx: -dir * (0.9 + vrand() * 2.2) + (vrand() - 0.5) * 1.6,
+      vy: -0.6 - vrand() * 1.5,
+      size: 2.5 + vrand() * 1.5,
       color: i % 2 === 0 ? '#94a3b8' : '#64748b',
       life: 15,
       maxLife: 15,
       gravity: i % 3 === 0 ? 0.16 : 0.02,
       drag: 0.9,
       shape: i % 3 === 0 ? 'debris' : 'pixel',
-      angle: Math.random() * Math.PI,
-      spin: (Math.random() - 0.5) * 0.25,
+      angle: vrand() * Math.PI,
+      spin: (vrand() - 0.5) * 0.25,
     });
   }
 }

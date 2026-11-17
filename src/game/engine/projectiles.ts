@@ -15,6 +15,16 @@ export function updateProjectiles(ctx: EngineContext): void {
     p.ttl--;
 
     if (p.ttl <= 0 || Math.abs(p.x) > 620) {
+      if (Math.abs(p.x) <= 620) {
+        ctx.vfxEvents.push({
+          type: 'impact',
+          x: p.x,
+          y: p.y,
+          dir: Math.atan2(p.vy, p.vx),
+          power: 0.4,
+          color: p.color,
+        });
+      }
       ctx.projectiles.splice(i, 1);
       continue;
     }
@@ -43,6 +53,14 @@ export function updateProjectiles(ctx: EngineContext): void {
         target.countersLanded++;
         target.gauge = Math.min(100, target.gauge + 20);
         spawnHitSparks(ctx, p.x, p.y, '#fef08a', 14);
+        ctx.vfxEvents.push({
+          type: 'impact',
+          x: p.x,
+          y: p.y,
+          dir: Math.atan2(p.vy, p.vx),
+          power: 0.55,
+          color: '#fef08a',
+        });
         ctx.callouts.push({
           x: target.x,
           y: target.y - 34,
@@ -71,6 +89,14 @@ export function updateProjectiles(ctx: EngineContext): void {
           isProjectile: true,
           pullTarget: isHook,
           appliesCinder: isHook,
+        });
+        ctx.vfxEvents.push({
+          type: 'impact',
+          x: p.x,
+          y: p.y,
+          dir: Math.atan2(p.vy, p.vx),
+          power: 0.55,
+          color: p.color,
         });
         ctx.projectiles.splice(i, 1);
       }

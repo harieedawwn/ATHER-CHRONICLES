@@ -29,6 +29,14 @@ function tryAbsorbWithSuperArmor(
     defender.flashWhiteFrames = 4;
     attacker.hitstopFrames = 5;
     spawnHitSparks(ctx, defender.x, defender.y - 8, '#facc15', 10);
+    ctx.vfxEvents.push({
+      type: 'impact',
+      x: defender.x,
+      y: defender.y - 8,
+      dir: attacker.x <= defender.x ? 0 : Math.PI,
+      power: 0.25,
+      color: '#facc15',
+    });
     ctx.callouts.push({
       x: defender.x,
       y: defender.y - 36,
@@ -189,6 +197,19 @@ export function applyHitToFighter(
   }
 
   spawnHitSparks(ctx, defender.x, defender.y - 8, attacker.spec.secondaryColor, isHeavy ? 18 : 9);
+  const hitDir = Math.atan2(defender.vy, defender.vx || attacker.facing);
+  const isStrongOrSpecial =
+    isHeavy ||
+    attacker.currentMove?.category === 'strong' ||
+    attacker.currentMove?.category === 'special';
+  ctx.vfxEvents.push({
+    type: 'impact',
+    x: defender.x,
+    y: defender.y - 8,
+    dir: hitDir,
+    power: isStrongOrSpecial ? 0.9 : 0.25,
+    color: attacker.spec.accentColor,
+  });
   ctx.sound.playAttackHit(
     attacker.id,
     defender.id,
@@ -209,6 +230,15 @@ export function applyHitToFighter(
       ctx.triggerTimeDilation(0.22, 34);
       ctx.shakeMag = 16;
       ctx.winnerSlot = attacker.slot;
+      ctx.vfxEvents.push({
+        type: 'ko',
+        x: defender.x,
+        y: defender.y - 8,
+        dir: hitDir,
+        power: 1.0,
+        color: attacker.spec.accentColor,
+        seed: ctx.tick,
+      });
       ctx.sound.playKO();
       ctx.emitHUD(true);
     }

@@ -153,6 +153,15 @@ function resolveAirbornePlatforms(
           lineWidth: 2.2,
         });
         spawnDust(ctx, f.x, p.top, 0);
+        ctx.vfxEvents.push({
+          type: 'impact',
+          x: f.x,
+          y: p.top,
+          dir: -Math.PI / 2,
+          power: 0.65,
+          color: f.spec.accentColor,
+          ground: true,
+        });
         ctx.sound.playWallSlam(f.id, 1.15, Math.max(-0.85, Math.min(0.85, f.x / 360)));
         break;
       }
@@ -262,6 +271,15 @@ export function applyPhysics(
       spawnDust(ctx, f.x - 8, f.y + 18, -1);
       spawnDust(ctx, f.x + 8, f.y + 18, 1);
       ctx.shakeMag = Math.max(ctx.shakeMag, 2.6 * weightRatio);
+      ctx.vfxEvents.push({
+        type: 'impact',
+        x: f.x,
+        y: f.y + 18,
+        dir: -Math.PI / 2,
+        power: Math.min(0.65, impactVy / 12),
+        color: f.spec.accentColor,
+        ground: true,
+      });
     }
     if (f.action === 'air' || f.action === 'airdodge') {
       f.action = 'idle';

@@ -27,6 +27,17 @@ export type UltBackdropMode =
   | 'impact_bw'
   | 'climax_flash';
 
+export interface VfxEvent {
+  type?: 'impact' | 'dash' | 'blink' | 'ko';
+  x: number;
+  y: number;
+  dir: number;
+  power: number;
+  color: string;
+  ground?: boolean;
+  seed?: number;
+}
+
 export interface EngineContext {
   config: MatchConfig;
   stage: StageSpec;
@@ -42,6 +53,7 @@ export interface EngineContext {
   shockwaves: ShockwaveRing[];
   particles: Particle[];
   callouts: FloatingCallout[];
+  vfxEvents: VfxEvent[];
 
   nextProjId: number;
   tick: number;

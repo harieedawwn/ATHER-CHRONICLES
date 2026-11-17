@@ -1,6 +1,22 @@
-import { blendPoseArc, sampleAttack } from './poseKit';
-import { hexToRgb, drawShockRing, drawStreak, drawStarFlare, drawArcSweep } from './vfxKit';
+import { blendPoseArc, sampleAttack, locomotionPose, hitShake } from './poseKit';
+import {
+  Fx,
+  Trail,
+  ChromaticSplit,
+  CameraKick,
+  energyRamp,
+  drawGlow,
+  drawInkSplat,
+  drawImpactFrame,
+  hexToRgb,
+  drawShockRing,
+  drawStreak,
+  drawStarFlare,
+  drawArcSweep,
+  vrand,
+} from './vfxKit';
 import { getAuthoredMove } from './movePoses';
+import type { VfxEvent } from './engine/context';
 import {
   Afterimage,
   DelayedSlash,
@@ -139,6 +155,7 @@ export interface RenderSceneData {
   shockwaves: ShockwaveRing[];
   particles: Particle[];
   callouts: FloatingCallout[];
+  vfxEvents?: VfxEvent[];
   camX: number;
   camY: number;
   camZoom: number;
@@ -162,6 +179,24 @@ export class HDPixelRenderer {
     number,
     { pose: SkeletonPose; x: number; y: number; facing: 1 | -1; tick: number }
   >();
+  private weaponTrails = new Map<number, { trail: Trail; lastTick: number; weaponType: WeaponType }>();
+  private projectileTrails = new Map<number, { trail: Trail; lastTick: number }>();
+  private inkSplats: {
+    x: number;
+    y: number;
+    r: number;
+    age: number;
+    life: number;
+    color: string;
+    seed: number;
+    isBlink?: boolean;
+  }[] = [];
+  private fx = new Fx();
+  private chromaticSplit = new ChromaticSplit();
+  private chromaticFrames = 0;
+  private cameraKick = new CameraKick();
+  private lastFxTick = -1;
+  private lastChargeEmitTick = -1;
 
   constructor() {
     this.buffer = document.createElement('canvas');
@@ -179,6 +214,111 @@ export class HDPixelRenderer {
     ctx.globalAlpha = 1;
     ctx.imageSmoothingEnabled = false;
 
+    if (scene.vfxEvents && scene.vfxEvents.length > 0) {
+      for (const ev of scene.vfxEvents) {
+        if (ev.type === 'dash') {
+          this.fx.pool.emit({
+            x: ev.x,
+            y: ev.y,
+            count: 8,
+            angle: ev.dir + Math.PI,
+            spread: 0.35,
+            speed: [5, 11],
+            life: [7, 13],
+            size: [1.5, 2.8],
+            drag: 0.88,
+            kind: 'streak',
+            ramp: energyRamp(ev.color),
+            stretch: 1.9,
+          });
+        } else if (ev.type === 'blink') {
+          const ramp = energyRamp(ev.color);
+          for (let i = 0; i < 8; i++) {
+            const a = (i / 8) * Math.PI * 2;
+            this.fx.pool.emit({
+              x: ev.x + Math.cos(a) * 26,
+              y: ev.y + Math.sin(a) * 26,
+              count: 1,
+              angle: a + Math.PI,
+              spread: 0.15,
+              speed: [3.5, 5.5],
+              life: [6, 9],
+              size: [1.4, 2.4],
+              drag: 0.92,
+              kind: 'streak',
+              ramp,
+              stretch: 1.7,
+            });
+          }
+          this.fx.pool.emit({
+            x: ev.x,
+            y: ev.y,
+            count: 10,
+            angle: 0,
+            spread: Math.PI * 2,
+            speed: [4, 9],
+            life: [8, 14],
+            size: [1.5, 2.6],
+            drag: 0.89,
+            kind: 'streak',
+            ramp,
+            stretch: 1.8,
+          });
+          this.inkSplats.push({
+            x: ev.x,
+            y: ev.y,
+            r: 22,
+            age: 0,
+            life: 10,
+            color: ev.color,
+            seed: ev.seed ?? scene.tick,
+            isBlink: true,
+          });
+        } else if (ev.type === 'ko') {
+          this.fx.impact({
+            x: ev.x,
+            y: ev.y,
+            dir: ev.dir,
+            power: 1.0,
+            color: ev.color,
+          });
+          this.chromaticFrames = 6;
+          this.cameraKick.hit(1.0, ev.dir);
+          this.inkSplats.push({
+            x: ev.x,
+            y: ev.y,
+            r: 34,
+            age: 0,
+            life: 24,
+            color: ev.color,
+            seed: ev.seed ?? scene.tick,
+          });
+        } else {
+          this.fx.impact({
+            x: ev.x,
+            y: ev.y,
+            dir: ev.dir,
+            power: ev.power,
+            color: ev.color,
+            ground: ev.ground,
+          });
+          if (ev.power > 0.75 && !ev.ground) {
+            this.chromaticFrames = 5;
+            this.cameraKick.hit(ev.power, ev.dir);
+          }
+        }
+      }
+      scene.vfxEvents.length = 0;
+    }
+    if (scene.tick !== this.lastFxTick) {
+      this.lastFxTick = scene.tick;
+      this.fx.update();
+      this.cameraKick.step();
+      if (this.chromaticFrames > 0) this.chromaticFrames--;
+      for (const s of this.inkSplats) s.age++;
+      this.inkSplats = this.inkSplats.filter((s) => s.age < s.life);
+    }
+
     const has25DUltBackdrop =
       scene.ultBackdropMode !== undefined && scene.ultBackdropMode !== 'none';
 
@@ -192,16 +332,17 @@ export class HDPixelRenderer {
       this.drawParallaxStage(ctx, scene);
     }
 
-    // 2. World-space Camera Transform (with 2.5D camera banking & zoom)
+    // 2. World-space Camera Transform (with 2.5D camera banking, zoom & directional CameraKick)
+    const kick = this.cameraKick.offset;
     ctx.save();
     ctx.translate(
-      Math.round(RENDER_W * 0.5 + scene.shakeX),
-      Math.round(RENDER_H * 0.5 + scene.shakeY)
+      Math.round(RENDER_W * 0.5 + scene.shakeX + kick.ox),
+      Math.round(RENDER_H * 0.5 + scene.shakeY + kick.oy)
     );
     if (scene.camAngle) {
       ctx.rotate(scene.camAngle);
     }
-    ctx.scale(scene.camZoom, scene.camZoom);
+    ctx.scale(scene.camZoom * kick.zoom, scene.camZoom * kick.zoom);
     ctx.translate(-scene.camX, -scene.camY);
 
     // 3. Stage Platforms, Jump Pads & Spatial Boundaries (hidden during aerial sky-chase speedlines for pure 2.5D clarity)
@@ -235,8 +376,9 @@ export class HDPixelRenderer {
       this.drawGhostStickman(ctx, ghost);
     }
 
-    // 6. Kenji Observation Foresight Rings
+    // 6. Kenji Observation Foresight Rings & Ink / Blink Splat Underlays
     this.drawObservationForesight(ctx, scene.fighters, scene.tick);
+    this.drawInkAndBlinkSplats(ctx);
 
     // 7. Fighters (Sorted by 2.5D Z-depth so foreground fighter renders cleanly in front of background fighter!)
     const sortedFighters = [...scene.fighters].sort((a, b) => (b.z ?? 0) - (a.z ?? 0));
@@ -277,10 +419,11 @@ export class HDPixelRenderer {
       scene.camPitch ?? 0
     );
 
-    // 11. Particles (Sparks, 4-Point Flares, Debris, Wind Cones)
+    // 11. Particles (Sparks, 4-Point Flares, Debris, Wind Cones) + Layered vfxKit Impact Stack
     for (const pt of scene.particles) {
       this.drawParticle(ctx, pt);
     }
+    this.fx.draw(ctx);
 
     // 12. Optional Training Hitboxes (Fighters + Stage Platforms & Jump Pads)
     if (scene.showHitboxes) {
@@ -305,6 +448,12 @@ export class HDPixelRenderer {
 
     // 14. Cinematic Letterbox / Speed Lines on Impact, Ultimate Cut-In, or Time-Dilation Slow-Mo
     this.drawUltimateCutsceneOverlay(ctx, scene.fighters, scene.tick);
+    if (this.fx.impactFrameFrames > 0) {
+      drawImpactFrame(ctx, RENDER_W, RENDER_H, this.fx.impactFrameFrames);
+    }
+    if (this.chromaticFrames > 0) {
+      this.chromaticSplit.apply(ctx, this.buffer, 4);
+    }
     if (scene.impactFrames > 0) {
       this.drawImpactSpeedLines(ctx, scene.impactInverted, scene.tick);
     } else if (scene.timeDilation !== undefined && scene.timeDilation < 0.85) {
@@ -653,6 +802,11 @@ export class HDPixelRenderer {
           // 2.5D Foreshortened Floor Shadow & Combat Ring under the clash point
           const midX = (f.x + foe.x) * 0.5;
           const floorY = Math.max(f.y, foe.y) + 2;
+          if (bTick >= 7 && bTick <= 18) {
+            const splatR = 16 + (bTick - 7) * 1.1;
+            drawInkSplat(ctx, foe.x, foe.y - 10, splatR, beatIdx * 17 + 5, '#0b0b14');
+            drawInkSplat(ctx, foe.x + f.facing * 4, foe.y - 13, splatR * 0.78, beatIdx * 17 + 11, accent);
+          }
           ctx.strokeStyle = accent;
           ctx.globalAlpha = 0.48;
           ctx.lineWidth = 1.8;
@@ -2975,70 +3129,17 @@ export class HDPixelRenderer {
 
     if (action === 'walk' || action === 'dash') {
       const isDash = action === 'dash';
-      // Grounded, weighty martial-arts cadence (never frantic or blurry)
-      const spd = isDash ? 0.28 : 0.16;
-      const cycle = frame * spd;
+      const phase = frame * (isDash ? 0.28 : 0.18);
       const speedRatio = clamp01(Math.abs(vx) / (isDash ? 5.2 : 3.2));
-      const strideScale = 0.55 + speedRatio * 0.45;
-      const strideAmp = (isDash ? 14.2 : 9.8) * strideScale;
-      const kneeAmp = (isDash ? 9.6 : 6.8) * strideScale;
-
-      // 4-Phase Biomechanical Gait Solver for each leg (Contact -> Down/Load -> Pass/Drive -> High-Knee Swing)
-      const solveLeg = (phaseAngle: number, sideOffset: number) => {
-        const s = Math.sin(phaseAngle);
-        const c = Math.cos(phaseAngle);
-        // Swing phase occurs when c > 0 (leg moving from back to front through the air)
-        const swingPhase = Math.max(0, c);
-        const highKnee = Math.pow(swingPhase, 1.25) * (isDash ? 7.8 : 4.8) * strideScale;
-        const heelLift = Math.max(0, Math.sin(phaseAngle - 0.55)) * (isDash ? 8.8 : 5.2) * strideScale;
-        const footX = s * strideAmp + sideOffset * 0.4;
-        const footY = 18 - heelLift;
-        // Anatomical knee bends forward of the hip-to-foot line during the swing phase
-        const kneeForwardLead = swingPhase * (isDash ? 5.2 : 3.4);
-        const kneeX = s * kneeAmp + sideOffset + kneeForwardLead;
-        const kneeY = 8.5 - highKnee * 0.78;
-        return { knee: { x: kneeX, y: kneeY }, foot: { x: footX, y: footY } };
-      };
-
-      const legF = solveLeg(cycle, 2.2);
-      const legB = solveLeg(cycle + Math.PI, -1.8);
-
-      const stride = Math.sin(cycle);
-      // Double-frequency vertical center-of-mass bounce (lowest at heel-strike/absorption, highest at mid-pass)
-      const bounce = Math.sin(cycle * 2 - 0.35) * (isDash ? 1.85 : 1.15) * strideScale;
-      const speedLean = Math.min(3.8, Math.abs(vx) * 0.55);
-      const lean = (isDash ? 7.8 : 3.2) + speedLean;
-      const torsoTwist = stride * (isDash ? 2.6 : 1.55) * strideScale;
-      const armSwing = stride * (isDash ? 8.5 : 5.6) * strideScale;
-
+      const intensity = (isDash ? 1.6 : 1.0) * (0.65 + speedRatio * 0.35);
+      const loco = locomotionPose(base, phase, intensity);
+      const stride = Math.sin(phase);
       return {
-        ...base,
-        hip: { x: (isDash ? 1.8 : 0.6) + stride * 0.6, y: -0.6 + bounce },
-        spine: { x: lean * 0.52, y: -8 + bounce * 0.9 },
-        chest: { x: lean, y: -14 + bounce * 0.85 },
-        head: { x: lean + 3.2, y: -23.2 + bounce * 0.7 },
-        shoulderF: { x: lean + 1.6 - torsoTwist, y: -13 + bounce * 0.85 },
-        shoulderB: { x: lean - 2.0 + torsoTwist, y: -13 + bounce * 0.85 },
-        kneeF: legF.knee,
-        footF: legF.foot,
-        kneeB: legB.knee,
-        footB: legB.foot,
-        elbowF: {
-          x: lean - armSwing * 0.75 + 1.5,
-          y: -9.2 + bounce + Math.abs(stride) * 1.1,
-        },
-        handF: {
-          x: isDash && weaponType === 'dagger' ? -8.5 : lean - armSwing * 1.15 + 4.5,
-          y: isDash && weaponType === 'dagger' ? -5.5 : -6.2 + bounce - Math.max(0, -stride) * 2.2,
-        },
-        elbowB: {
-          x: lean + armSwing * 0.75 - 2.8,
-          y: -9.2 + bounce + Math.abs(stride) * 1.1,
-        },
-        handB: {
-          x: lean + armSwing * 1.1 - 4.2,
-          y: -5.5 + bounce - Math.max(0, stride) * 2.2,
-        },
+        ...loco,
+        handF:
+          isDash && weaponType === 'dagger'
+            ? { x: -8.5, y: -5.5 }
+            : loco.handF,
         weaponAngle: isDash ? 2.65 : -0.78 + stride * 0.14,
         sheathed: weaponType === 'katana' && !isDash ? true : false,
       };
@@ -5193,23 +5294,23 @@ export class HDPixelRenderer {
     const wy = pose.handF.y;
     const reach = pose.weaponReach;
 
-    // 1. Frame-Accurate Motion Smear Fan on Active Swing Frames
-    if (pose.smearAlpha && pose.smearAlpha > 0.05 && pose.smearSpan) {
-      ctx.save();
-      ctx.globalAlpha = alpha * pose.smearAlpha * 0.45;
-      ctx.fillStyle = accentColor;
-      ctx.beginPath();
-      ctx.moveTo(wx, wy);
-      ctx.arc(
-        wx,
-        wy,
-        reach + 10,
-        pose.weaponAngle - pose.smearSpan,
-        pose.weaponAngle + 0.08
+    // 1. Multi-Layered Sweeping Ribbon Smear on Active Swing Frames (replaces flat arc fill)
+    if (pose.smearAlpha && pose.smearAlpha > 0.05 && pose.smearSpan && !pose.sheathed) {
+      drawArcSweep(
+        ctx,
+        {
+          x: wx,
+          y: wy,
+          facing: 1,
+          angleStart: pose.weaponAngle - pose.smearSpan,
+          angleEnd: pose.weaponAngle + 0.08,
+          radius: reach + 8,
+          thickness: weaponType === 'dagger' ? 2.8 : weaponType === 'titan' ? 5.2 : 3.8,
+          color: accentColor,
+          coreColor: '#ffffff',
+        },
+        clamp01(1 - pose.smearAlpha * 0.75)
       );
-      ctx.closePath();
-      ctx.fill();
-      ctx.restore();
     }
 
     // 2. Detailed Multi-Part Weapon Rendering per Fighter
@@ -5857,6 +5958,66 @@ export class HDPixelRenderer {
     ctx.restore();
   }
 
+  private computeWeaponTipLocal(pose: SkeletonPose, weaponType: WeaponType): Vec2 {
+    const wx = pose.handF.x;
+    const wy = pose.handF.y;
+    const reach = pose.weaponReach;
+    const ang = pose.weaponAngle;
+    const c = Math.cos(ang);
+    const s = Math.sin(ang);
+
+    switch (weaponType) {
+      case 'scythe': {
+        const shaftLen = reach + 7;
+        const lx = shaftLen + 6;
+        const ly = 14;
+        return { x: wx + c * lx - s * ly, y: wy + s * lx + c * ly };
+      }
+      case 'katana': {
+        if (pose.sheathed) return { x: pose.hip.x + 12, y: pose.hip.y - 5 };
+        const bladeLen = reach + 9;
+        return { x: wx + c * (bladeLen + 2), y: wy + s * (bladeLen + 2) };
+      }
+      case 'dagger': {
+        const scaleLen = reach + 2;
+        return { x: wx + c * (scaleLen + 4), y: wy + s * (scaleLen + 4) };
+      }
+      case 'spear': {
+        const tipX = reach + 18;
+        return { x: wx + c * tipX, y: wy + s * tipX };
+      }
+      case 'gauntlet': {
+        const gAng = Math.atan2(wy - pose.elbowF.y, wx - pose.elbowF.x);
+        return { x: wx + Math.cos(gAng) * 6.5, y: wy + Math.sin(gAng) * 6.5 };
+      }
+      case 'titan': {
+        const tAng = Math.atan2(wy - pose.elbowF.y, wx - pose.elbowF.x);
+        return { x: wx + Math.cos(tAng) * 9.5, y: wy + Math.sin(tAng) * 9.5 };
+      }
+      case 'chains':
+        return { x: wx + c * (reach + 3), y: wy + s * (reach + 3) };
+      case 'orbs':
+        return { x: wx + c * (reach * 0.85), y: wy + s * (reach * 0.85) };
+      case 'claws':
+        return { x: wx + c * 13, y: wy + s * 13 };
+    }
+  }
+
+  private getWeaponTrailWidth(weaponType: WeaponType, move: MoveData | null, action: FighterAction): number {
+    if (weaponType === 'dagger') {
+      if (action === 'ultimate' || move?.category === 'strong' || move?.category === 'special') return 9;
+      if (move?.key.startsWith('jab')) return 6;
+      return 7.5;
+    }
+    if (action === 'ultimate' || move?.category === 'strong' || move?.category === 'special') {
+      return weaponType === 'titan' || weaponType === 'scythe' ? 26 : 23;
+    }
+    if (move?.key.startsWith('jab')) {
+      return 11;
+    }
+    return 15;
+  }
+
   private drawFighter(
     ctx: CanvasRenderingContext2D,
     f: FighterState,
@@ -5864,7 +6025,10 @@ export class HDPixelRenderer {
     impactInverted: boolean,
     tick: number
   ): void {
-    if (f.action === 'ko_respawn') return;
+    if (f.action === 'ko_respawn') {
+      this.weaponTrails.get(f.slot)?.trail.clear();
+      return;
+    }
 
     // 0. Dynamic Ground Contact Shadow beneath Fighter
     if (!isImpact) {
@@ -5908,8 +6072,8 @@ export class HDPixelRenderer {
         ctx.beginPath();
         ctx.moveTo(Math.round(lx), Math.round(ly));
         for (let seg = 0; seg < 3; seg++) {
-          lx += (Math.random() - 0.5) * 14;
-          ly -= 6 + Math.random() * 6;
+          lx += (vrand() - 0.5) * 14;
+          ly -= 6 + vrand() * 6;
           ctx.lineTo(Math.round(lx), Math.round(ly));
         }
         ctx.stroke();
@@ -6194,10 +6358,96 @@ export class HDPixelRenderer {
     // 2.5D Z-Depth Foreshortening Scale ($S(z) = \frac{260}{260 + z}$, negative z = closer to camera = larger!)
     const zScale = f.z ? Math.max(0.68, Math.min(1.52, 260 / (260 + f.z))) : 1;
 
+    const shake =
+      f.action === 'hitstun' && f.hitstopFrames > 0
+        ? hitShake(f.hitstopFrames, 2.2, f.slot)
+        : { x: 0, y: 0 };
+
+    const drawX = f.x + (f.vibrateX || 0) + shake.x;
+    const drawY = f.y + shake.y;
+    const sx = f.squashX * zScale;
+    const sy = f.squashY * zScale;
+
+    // Weapon-tip Trail per fighter (docs/VFX_SKILL.md Section 6.1)
+    const maxAge =
+      f.spec.weaponType === 'dagger'
+        ? 6
+        : f.spec.weaponType === 'chains' || f.spec.weaponType === 'scythe'
+        ? 14
+        : 9;
+    let trailEntry = this.weaponTrails.get(f.slot);
+    if (!trailEntry || trailEntry.weaponType !== f.spec.weaponType) {
+      trailEntry = { trail: new Trail(16, maxAge), lastTick: tick - 1, weaponType: f.spec.weaponType };
+      this.weaponTrails.set(f.slot, trailEntry);
+    }
+    if (prevRecord && Math.hypot(f.x - prevRecord.x, f.y - prevRecord.y) > 110) {
+      trailEntry.trail.clear();
+    }
+    if (tick !== trailEntry.lastTick) {
+      trailEntry.lastTick = tick;
+      if ((pose.smearAlpha ?? 0) > 0.15 && !pose.sheathed) {
+        const tipLocal = this.computeWeaponTipLocal(pose, f.spec.weaponType);
+        const tipX = drawX + f.facing * sx * tipLocal.x;
+        const tipY = drawY + sy * tipLocal.y;
+        trailEntry.trail.push(tipX, tipY);
+      }
+      trailEntry.trail.step();
+    }
+    if (!isImpact && trailEntry.trail.length >= 2) {
+      trailEntry.trail.draw(ctx, {
+        color: f.spec.accentColor,
+        core: '#ffffff',
+        width: this.getWeaponTrailWidth(f.spec.weaponType, f.currentMove, f.action),
+        alpha,
+      });
+    }
+
+    // Charge-Up Inward Streaks & Weapon Hand Glow (docs/VFX_SKILL.md Section 3)
+    if (
+      !isImpact &&
+      (f.action === 'strong_charge' || (f.action === 'ultimate' && f.actionFrame <= 60))
+    ) {
+      if (tick % 2 === 0 && this.lastChargeEmitTick !== tick) {
+        this.lastChargeEmitTick = tick;
+        const ramp = energyRamp(f.spec.accentColor);
+        for (let k = 0; k < 4; k++) {
+          const ang = vrand() * Math.PI * 2;
+          const dist = 32 + vrand() * 12;
+          this.fx.pool.emit({
+            x: f.x + Math.cos(ang) * dist,
+            y: f.y - 10 + Math.sin(ang) * dist,
+            count: 1,
+            angle: ang + Math.PI,
+            spread: 0.14,
+            speed: [3, 5],
+            life: [8, 12],
+            size: [1.5, 2.4],
+            drag: 0.96,
+            kind: 'streak',
+            ramp,
+            stretch: 1.7,
+          });
+        }
+      }
+      const handWorldX = drawX + f.facing * sx * pose.handF.x;
+      const handWorldY = drawY + sy * pose.handF.y;
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      drawGlow(
+        ctx,
+        handWorldX,
+        handWorldY,
+        14 + Math.sin(tick * 0.4) * 4,
+        hexToRgb(f.spec.accentColor),
+        0.85
+      );
+      ctx.restore();
+    }
+
     this.drawStickSkeleton(
       ctx,
-      f.x + (f.vibrateX || 0),
-      f.y,
+      drawX,
+      drawY,
       f.facing,
       pose,
       bodyColor,
@@ -6205,8 +6455,8 @@ export class HDPixelRenderer {
       accent,
       secondary,
       f.spec.weaponType,
-      f.squashX * zScale,
-      f.squashY * zScale,
+      sx,
+      sy,
       true,
       alpha,
       hasEyeTrail,
@@ -6401,13 +6651,65 @@ export class HDPixelRenderer {
     ctx.restore();
   }
 
+  private drawInkAndBlinkSplats(ctx: CanvasRenderingContext2D): void {
+    for (const s of this.inkSplats) {
+      const t = clamp01(s.age / s.life);
+      if (s.isBlink) {
+        const col = hexToRgb(s.color);
+        // Contracting ring at origin + expanding shock ring
+        drawShockRing(ctx, s.x, s.y, 1 - t, s.r * 1.15, 4, col);
+        drawShockRing(ctx, s.x, s.y, t, s.r * 1.55, 4.5, col);
+        if (s.color === '#a855f7' || s.color === '#e879f9') {
+          ctx.save();
+          ctx.globalAlpha = 1 - t;
+          drawInkSplat(ctx, s.x, s.y, s.r * (0.65 + t * 0.35), s.seed, '#0b0b14');
+          ctx.restore();
+        } else {
+          drawStarFlare(ctx, s.x, s.y, s.r * 0.42, t * 1.2, col, 1 - t);
+        }
+      } else {
+        ctx.save();
+        ctx.globalAlpha = 1 - Math.pow(t, 1.6);
+        const rad = s.r * (0.7 + t * 0.45);
+        drawInkSplat(ctx, s.x, s.y, rad, s.seed, '#0b0b14');
+        drawInkSplat(ctx, s.x + 5, s.y - 3, rad * 0.8, s.seed + 7, s.color);
+        ctx.restore();
+      }
+    }
+  }
+
   private drawProjectile(ctx: CanvasRenderingContext2D, p: Projectile, tick: number): void {
+    // 1. Ribbon Trail per projectile (docs/VFX_SKILL.md Section 3)
+    let pTrail = this.projectileTrails.get(p.id);
+    if (!pTrail) {
+      pTrail = { trail: new Trail(10, 7), lastTick: tick - 1 };
+      this.projectileTrails.set(p.id, pTrail);
+    }
+    if (tick !== pTrail.lastTick) {
+      pTrail.lastTick = tick;
+      pTrail.trail.push(p.x, p.y);
+      pTrail.trail.step();
+    }
+    pTrail.trail.draw(ctx, {
+      color: p.color,
+      core: '#ffffff',
+      width: p.radius * 1.8,
+    });
+
+    const col = hexToRgb(p.color);
+    const dir = p.vx >= 0 ? 1 : -1;
+
+    // 2. Soft Additive Glow Halo
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    drawGlow(ctx, p.x, p.y, p.radius * 2.8, col, 0.7);
+    ctx.restore();
+
+    // 3. Crescent Energy Body + White-Hot Core
     ctx.save();
     ctx.translate(Math.round(p.x), Math.round(p.y));
-    const dir = p.vx >= 0 ? 1 : -1;
     ctx.scale(dir, 1);
 
-    // Crescent anime energy wave
     ctx.fillStyle = p.color;
     ctx.beginPath();
     ctx.arc(0, 0, p.radius + 4, -1.25, 1.25);
@@ -6421,15 +6723,18 @@ export class HDPixelRenderer {
     ctx.arc(-2, 0, p.radius * 0.7, 0.85, -0.85, true);
     ctx.closePath();
     ctx.fill();
-
-    // Trailing energy tail
-    ctx.strokeStyle = p.color;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(-p.radius, -3 + Math.sin(tick * 0.4) * 2);
-    ctx.lineTo(-p.radius - 14, 0);
-    ctx.stroke();
     ctx.restore();
+
+    // 4. Rotating 4-Point Star Flare at Nose
+    drawStarFlare(
+      ctx,
+      p.x + dir * p.radius * 0.6,
+      p.y,
+      p.radius * 0.6,
+      tick * 0.25,
+      col,
+      0.95
+    );
   }
 
   // Tapered Crescent Anime Slash Arc with outer glow & white-hot core
@@ -6481,16 +6786,32 @@ export class HDPixelRenderer {
       ctx.fillStyle = '#e2e8f0';
       ctx.fillRect(-sz * 0.6, -sz * 0.5, sz * 0.8, 1.2);
     } else if (pt.shape === 'wind_cone') {
-      // Sonic boom chevron cone for `P` Dash
+      // 3-Layer Sonic Dash Cone + Squashed Shock Ring (docs/VFX_SKILL.md Section 3)
+      const col = hexToRgb(pt.color);
+      const t = clamp01(1 - alpha);
+      ctx.globalAlpha = 1;
+      drawShockRing(ctx, Math.round(pt.x), Math.round(pt.y), t, sz * 4.2, 4, col, 0.45);
       ctx.translate(Math.round(pt.x), Math.round(pt.y));
       ctx.rotate(pt.angle ?? 0);
+      ctx.globalCompositeOperation = 'lighter';
+      drawGlow(ctx, 0, 0, sz * 2.5, col, alpha * 0.65);
       ctx.strokeStyle = pt.color;
-      ctx.lineWidth = 2;
+      ctx.globalAlpha = alpha * 0.85;
+      ctx.lineWidth = 3.2;
       ctx.beginPath();
-      ctx.moveTo(8, 0);
-      ctx.lineTo(-10, -13);
-      ctx.moveTo(8, 0);
-      ctx.lineTo(-10, 13);
+      ctx.moveTo(9, 0);
+      ctx.lineTo(-11, -14);
+      ctx.moveTo(9, 0);
+      ctx.lineTo(-11, 14);
+      ctx.stroke();
+      ctx.strokeStyle = '#ffffff';
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.moveTo(9, 0);
+      ctx.lineTo(-9, -12);
+      ctx.moveTo(9, 0);
+      ctx.lineTo(-9, 12);
       ctx.stroke();
     } else {
       ctx.fillStyle = pt.color;

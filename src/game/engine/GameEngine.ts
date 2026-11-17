@@ -71,6 +71,7 @@ export class GameEngine {
       shockwaves: [],
       particles: [],
       callouts: [],
+      vfxEvents: [],
       nextProjId: 1,
       tick: 0,
       matchFrames: 0,
@@ -172,6 +173,7 @@ export class GameEngine {
     this.ctx.shockwaves = [];
     this.ctx.particles = [];
     this.ctx.callouts = [];
+    this.ctx.vfxEvents = [];
     this.ctx.lastComboHits = 0;
     this.ctx.lastComboDamage = 0;
     this.ctx.camAngle = 0;
@@ -276,6 +278,7 @@ export class GameEngine {
         shockwaves: this.ctx.shockwaves,
         particles: this.ctx.particles,
         callouts: this.ctx.callouts,
+        vfxEvents: this.ctx.vfxEvents,
         camX: this.ctx.camX,
         camY: this.ctx.camY,
         camZoom: this.ctx.camZoom,
@@ -320,6 +323,7 @@ export class GameEngine {
   public stepHeadless(p1InputOverride?: InputState): void {
     if (this.ctx.paused) return;
     this.stepWithTimeDilation(p1InputOverride);
+    this.ctx.vfxEvents.length = 0;
   }
 
   public getFighters(): [FighterState, FighterState] {
